@@ -812,61 +812,14 @@ proc av_get_audio_frame_duration2*(par: ptr AVCodecParameters; frame_bytes: cint
 proc av_get_audio_frame_duration*(avctx: ptr AVCodecContext; frame_bytes: cint): cint {.
     cdecl, importc: "av_get_audio_frame_duration".}
 
-proc av_get_packet*(s: ptr AVIOContext; pkt: ptr AVPacket; size: cint): cint {.
-    cdecl, importc: "av_get_packet".}
-
-proc av_append_packet*(s: ptr AVIOContext; pkt: ptr AVPacket; size: cint): cint {.
-    cdecl, importc: "av_append_packet".}
-
 proc av_disposition_from_string*(disp: cstring): cint {.cdecl,
     importc: "av_disposition_from_string".}
 
 proc av_disposition_to_string*(disposition: cint): cstring {.cdecl,
     importc: "av_disposition_to_string".}
 
-proc av_stream_get_parser*(s: ptr AVStream): ptr struct_AVCodecParserContext {.
-    cdecl, importc: "av_stream_get_parser".}
-
-proc av_stream_get_first_dts*(st: ptr AVStream): int64 {.cdecl,
-    importc: "av_stream_get_first_dts".}
-
-proc av_stream_get_class*(): ptr AVClass {.cdecl, importc: "av_stream_get_class".}
-
-proc av_stream_group_get_class*(): ptr AVClass {.cdecl,
-    importc: "av_stream_group_get_class".}
-
 proc av_new_program*(s: ptr AVFormatContext; id: cint): ptr AVProgram {.cdecl,
     importc: "av_new_program".}
-
-proc av_program_add_stream_index*(ac: ptr AVFormatContext; progid: cint;
-                                  idx: cuint): void {.cdecl,
-    importc: "av_program_add_stream_index".}
-
-proc av_read_frame*(s: ptr AVFormatContext; pkt: ptr AVPacket): cint {.cdecl,
-    importc: "av_read_frame".}
-
-proc av_seek_frame*(s: ptr AVFormatContext; stream_index: cint;
-                    timestamp: int64; flags: cint): cint {.cdecl,
-    importc: "av_seek_frame".}
-
-proc av_read_play*(s: ptr AVFormatContext): cint {.cdecl,
-    importc: "av_read_play".}
-
-proc av_read_pause*(s: ptr AVFormatContext): cint {.cdecl,
-    importc: "av_read_pause".}
-
-proc av_hex_dump*(f: ptr FILE; buf: ptr uint8; size: cint): void {.cdecl,
-    importc: "av_hex_dump".}
-
-proc av_hex_dump_log*(avcl: pointer; level: cint; buf: ptr uint8; size: cint): void {.
-    cdecl, importc: "av_hex_dump_log".}
-
-proc av_pkt_dump2*(f: ptr FILE; pkt: ptr AVPacket; dump_payload: cint;
-                   st: ptr AVStream): void {.cdecl, importc: "av_pkt_dump2".}
-
-proc av_pkt_dump_log2*(avcl: pointer; level: cint; pkt: ptr AVPacket;
-                       dump_payload: cint; st: ptr AVStream): void {.cdecl,
-    importc: "av_pkt_dump_log2".}
 
 proc av_codec_get_id*(tags: ptr ptr struct_AVCodecTag; tag: cuint): enum_AVCodecID {.
     cdecl, importc: "av_codec_get_id".}
@@ -885,12 +838,6 @@ proc av_add_index_entry*(st: ptr AVStream; pos: int64; timestamp: int64;
                          size: cint; distance: cint; flags: cint): cint {.cdecl,
     importc: "av_add_index_entry".}
 
-proc av_url_split*(proto: cstring; proto_size: cint; authorization: cstring;
-                   authorization_size: cint; hostname: cstring;
-                   hostname_size: cint; port_ptr: ptr cint; path: cstring;
-                   path_size: cint; url: cstring): void {.cdecl,
-    importc: "av_url_split".}
-
 proc av_dump_format*(ic: ptr AVFormatContext; index: cint; url: cstring;
                      is_output: cint): void {.cdecl, importc: "av_dump_format".}
 
@@ -902,15 +849,6 @@ proc av_get_frame_filename*(buf: cstring; buf_size: cint; path: cstring;
                             number: cint): cint {.cdecl,
     importc: "av_get_frame_filename".}
 
-proc av_filename_number_test*(filename: cstring): cint {.cdecl,
-    importc: "av_filename_number_test".}
-
-proc av_match_ext*(filename: cstring; extensions: cstring): cint {.cdecl,
-    importc: "av_match_ext".}
-
 proc av_mime_codec_str*(par: ptr AVCodecParameters; frame_rate: AVRational;
                         out_arg: ptr struct_AVBPrint): cint {.cdecl,
     importc: "av_mime_codec_str".}
-
-proc av_stream_get_codec_timebase*(st: ptr AVStream): AVRational {.cdecl,
-    importc: "av_stream_get_codec_timebase".}
