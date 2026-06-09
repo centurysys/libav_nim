@@ -316,6 +316,23 @@ proc durationSeconds*(timestamp: FrameTimestamp; seconds: var float64): bool =
 # =============================================================================
 
 type
+  PlaneView* = object
+    ## Borrowed view of one image plane.
+    ##
+    ## data is owned by FFmpeg or another upstream component. The view does not
+    ## own the memory.
+    data*: pointer
+    stride*: int
+    width*: int
+    height*: int
+
+  Yuv420Layout* = object
+    ## Byte sizes implied by a YUV420P/I420 frame layout.
+    yBytes*: int
+    uBytes*: int
+    vBytes*: int
+    totalBytes*: int
+
   Yuv420FrameView* = object
     ## Borrowed view of a decoded YUV420P/I420 frame.
     ##
@@ -323,6 +340,7 @@ type
     ## owning AVFrame is unref'ed/freed or reused by the decoder.
     width*: int
     height*: int
+    format*: PixelFormat
     y*: pointer
     u*: pointer
     v*: pointer
@@ -332,6 +350,156 @@ type
     pts*: int64
     timeBase*: Rational
     timestamp*: FrameTimestamp
+
+# =============================================================================
+# === Borrowed frame view helpers
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# --- pixelFormatName
+# -----------------------------------------------------------------------------
+
+proc pixelFormatName*(format: PixelFormat): string =
+  case format
+  of pfUnknown:
+    result = "unknown"
+  of pfYuv420p:
+    result = "yuv420p"
+  of pfNv12:
+    result = "nv12"
+  of pfNv21:
+    result = "nv21"
+  of pfRgb24:
+    result = "rgb24"
+  of pfRgba:
+    result = "rgba"
+  of pfBgra:
+    result = "bgra"
+  of pfRgbx:
+    result = "rgbx"
+  of pfBgrx:
+    result = "bgrx"
+
+# -----------------------------------------------------------------------------
+# --- planeByteSize
+# -----------------------------------------------------------------------------
+
+proc planeByteSize*(stride: int; height: int): int =
+  if stride <= 0 or height <= 0:
+    result = 0
+    return
+
+  result = stride * height
+
+# -----------------------------------------------------------------------------
+# --- yuv420Layout
+# -----------------------------------------------------------------------------
+
+proc yuv420Layout*(
+    width: int;
+    height: int;
+    yStride: int;
+    uStride: int;
+    vStride: int
+  ): Yuv420Layout =
+  let chromaHeight = (height + 1) div 2
+
+  result.yBytes = planeByteSize(yStride, height)
+  result.uBytes = planeByteSize(uStride, chromaHeight)
+  result.vBytes = planeByteSize(vStride, chromaHeight)
+  result.totalBytes = result.yBytes + result.uBytes + result.vBytes
+
+# -----------------------------------------------------------------------------
+# --- yuv420Layout
+# -----------------------------------------------------------------------------
+
+proc yuv420Layout*(frame: Yuv420FrameView): Yuv420Layout =
+  result = yuv420Layout(
+    frame.width,
+    frame.height,
+    frame.yStride,
+    frame.uStride,
+    frame.vStride
+  )
+
+# -----------------------------------------------------------------------------
+# --- yPlane
+# -----------------------------------------------------------------------------
+
+proc yPlane*(frame: Yuv420FrameView): PlaneView =
+  result = PlaneView(
+    data: frame.y,
+    stride: frame.yStride,
+    width: frame.width,
+    height: frame.height
+  )
+
+# -----------------------------------------------------------------------------
+# --- uPlane
+# -----------------------------------------------------------------------------
+
+proc uPlane*(frame: Yuv420FrameView): PlaneView =
+  result = PlaneView(
+    data: frame.u,
+    stride: frame.uStride,
+    width: (frame.width + 1) div 2,
+    height: (frame.height + 1) div 2
+  )
+
+# -----------------------------------------------------------------------------
+# --- vPlane
+# -----------------------------------------------------------------------------
+
+proc vPlane*(frame: Yuv420FrameView): PlaneView =
+  result = PlaneView(
+    data: frame.v,
+    stride: frame.vStride,
+    width: (frame.width + 1) div 2,
+    height: (frame.height + 1) div 2
+  )
+
+# -----------------------------------------------------------------------------
+# --- hasUsableYuv420Planes
+# -----------------------------------------------------------------------------
+
+proc hasUsableYuv420Planes*(frame: Yuv420FrameView): bool =
+  if frame.format != pfYuv420p:
+    return false
+
+  if frame.width <= 0 or frame.height <= 0:
+    return false
+
+  if frame.y.isNil or frame.u.isNil or frame.v.isNil:
+    return false
+
+  if frame.yStride < frame.width:
+    return false
+
+  if frame.uStride < ((frame.width + 1) div 2):
+    return false
+
+  if frame.vStride < ((frame.width + 1) div 2):
+    return false
+
+  result = true
+
+# -----------------------------------------------------------------------------
+# --- rgbxByteSize
+# -----------------------------------------------------------------------------
+
+proc rgbxByteSize*(width: int; height: int): int =
+  if width <= 0 or height <= 0:
+    result = 0
+    return
+
+  result = width * height * 4
+
+# -----------------------------------------------------------------------------
+# --- rgbxByteSize
+# -----------------------------------------------------------------------------
+
+proc rgbxByteSize*(frame: Yuv420FrameView): int =
+  result = rgbxByteSize(frame.width, frame.height)
 
 # =============================================================================
 # === Rational conversion

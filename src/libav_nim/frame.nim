@@ -211,6 +211,21 @@ proc toYuv420FrameView*(
     )
     return
 
+  if raw[].linesize[0] < raw[].width:
+    result = fail[Yuv420FrameView](
+      "toYuv420FrameView",
+      &"Invalid Y plane stride: {raw[].linesize[0]} for width {raw[].width}"
+    )
+    return
+
+  let chromaWidth = (int(raw[].width) + 1) div 2
+  if int(raw[].linesize[1]) < chromaWidth or int(raw[].linesize[2]) < chromaWidth:
+    result = fail[Yuv420FrameView](
+      "toYuv420FrameView",
+      &"Invalid chroma stride: U={raw[].linesize[1]} V={raw[].linesize[2]} for chroma width {chromaWidth}"
+    )
+    return
+
   var timestamp = emptyFrameTimestamp(timeBase)
   timestamp.pts = raw[].pts
   timestamp.bestEffortTimestamp = raw[].best_effort_timestamp
@@ -221,6 +236,7 @@ proc toYuv420FrameView*(
   result = ok(Yuv420FrameView(
     width: int(raw[].width),
     height: int(raw[].height),
+    format: pixelFormat,
     y: cast[pointer](raw[].data[0]),
     u: cast[pointer](raw[].data[1]),
     v: cast[pointer](raw[].data[2]),
