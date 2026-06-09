@@ -118,14 +118,14 @@ proc copyPlane(
 # --- ownedPlanePointers
 # -----------------------------------------------------------------------------
 
-proc yPointer(frame: var OwnedI420Frame): pointer =
+proc yPointer*(frame: var OwnedI420Frame): pointer =
   if frame.data.len == 0:
     result = nil
     return
 
   result = addr frame.data[0]
 
-proc uPointer(frame: var OwnedI420Frame): pointer =
+proc uPointer*(frame: var OwnedI420Frame): pointer =
   if frame.data.len == 0:
     result = nil
     return
@@ -133,7 +133,7 @@ proc uPointer(frame: var OwnedI420Frame): pointer =
   let offset = frame.ySize()
   result = addr frame.data[offset]
 
-proc vPointer(frame: var OwnedI420Frame): pointer =
+proc vPointer*(frame: var OwnedI420Frame): pointer =
   if frame.data.len == 0:
     result = nil
     return
@@ -141,14 +141,14 @@ proc vPointer(frame: var OwnedI420Frame): pointer =
   let offset = frame.ySize() + frame.uSize()
   result = addr frame.data[offset]
 
-proc yPointer(frame: OwnedI420Frame): pointer =
+proc yPointer*(frame: OwnedI420Frame): pointer =
   if frame.data.len == 0:
     result = nil
     return
 
   result = unsafeAddr frame.data[0]
 
-proc uPointer(frame: OwnedI420Frame): pointer =
+proc uPointer*(frame: OwnedI420Frame): pointer =
   if frame.data.len == 0:
     result = nil
     return
@@ -156,7 +156,7 @@ proc uPointer(frame: OwnedI420Frame): pointer =
   let offset = frame.ySize()
   result = unsafeAddr frame.data[offset]
 
-proc vPointer(frame: OwnedI420Frame): pointer =
+proc vPointer*(frame: OwnedI420Frame): pointer =
   if frame.data.len == 0:
     result = nil
     return
