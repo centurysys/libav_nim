@@ -89,3 +89,28 @@ proc streamIndex*(packet: Packet): FFmpegResult[int] =
     return
 
   result = ok(int(rawRet.value[].stream_index))
+
+# -----------------------------------------------------------------------------
+# --- packetTimestamp
+# -----------------------------------------------------------------------------
+
+proc packetTimestamp*(packet: Packet; timeBase: Rational): FFmpegResult[FrameTimestamp] =
+  let rawRet = packet.requireOpen()
+  if rawRet.isErr:
+    result = err(rawRet.error)
+    return
+
+  let raw = rawRet.value
+  var timestamp = emptyFrameTimestamp(timeBase)
+  timestamp.packetPts = raw[].pts
+  timestamp.packetDts = raw[].dts
+  timestamp.packetDuration = raw[].duration
+
+  if timestamp.packetPts.hasTimestampValue():
+    timestamp.selected = timestamp.packetPts
+    timestamp.source = tsPacketPts
+  elif timestamp.packetDts.hasTimestampValue():
+    timestamp.selected = timestamp.packetDts
+    timestamp.source = tsPacketDts
+
+  result = ok(timestamp)

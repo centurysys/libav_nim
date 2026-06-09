@@ -211,6 +211,13 @@ proc toYuv420FrameView*(
     )
     return
 
+  var timestamp = emptyFrameTimestamp(timeBase)
+  timestamp.pts = raw[].pts
+  timestamp.bestEffortTimestamp = raw[].best_effort_timestamp
+  timestamp.pktDts = raw[].pkt_dts
+  timestamp.duration = raw[].duration
+  timestamp.selectFrameTimestamp()
+
   result = ok(Yuv420FrameView(
     width: int(raw[].width),
     height: int(raw[].height),
@@ -221,5 +228,6 @@ proc toYuv420FrameView*(
     uStride: int(raw[].linesize[1]),
     vStride: int(raw[].linesize[2]),
     pts: raw[].pts,
-    timeBase: timeBase
+    timeBase: timeBase,
+    timestamp: timestamp
   ))

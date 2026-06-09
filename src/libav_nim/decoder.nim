@@ -41,6 +41,8 @@ type
     packet*: Packet
     frame*: Frame
     flushed*: bool
+    pendingTimestamps*: seq[FrameTimestamp]
+    frameIndex*: int64
 
 # =============================================================================
 # === Read-frame result
@@ -372,7 +374,9 @@ proc openVideoDecoder*(
     timeBase: stream[].time_base.toRational(),
     packet: packet,
     frame: frame,
-    flushed: false
+    flushed: false,
+    pendingTimestamps: @[],
+    frameIndex: 0
   ))
 
 # =============================================================================
@@ -402,6 +406,29 @@ proc requireOpen*(decoder: VideoDecoder): FFmpegResult[VideoDecoder] =
     return
 
   result = ok(decoder)
+
+# =============================================================================
+# === Timestamp queue helpers
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# --- pushPacketTimestamp
+# -----------------------------------------------------------------------------
+
+proc pushPacketTimestamp(decoder: VideoDecoder; timestamp: FrameTimestamp) =
+  decoder.pendingTimestamps.add(timestamp)
+
+# -----------------------------------------------------------------------------
+# --- popPacketTimestamp
+# -----------------------------------------------------------------------------
+
+proc popPacketTimestamp(decoder: VideoDecoder): FrameTimestamp =
+  if decoder.pendingTimestamps.len == 0:
+    result = emptyFrameTimestamp(decoder.timeBase)
+    return
+
+  result = decoder.pendingTimestamps[0]
+  decoder.pendingTimestamps.delete(0)
 
 # =============================================================================
 # === Packet feeding
@@ -452,10 +479,21 @@ proc sendNextPacket(decoder: VideoDecoder): FFmpegResult[bool] =
       decoder.packet.unref()
       continue
 
+    let timestampRet = decoder.packet.packetTimestamp(decoder.timeBase)
+    if timestampRet.isErr:
+      decoder.packet.unref()
+      result = err(timestampRet.error)
+      return
+
     let sendRet = avcodec_send_packet(decoder.codecCtx, packetPtr)
     decoder.packet.unref()
 
-    if sendRet == 0 or sendRet == avErrorAgain:
+    if sendRet == 0:
+      decoder.pushPacketTimestamp(timestampRet.value)
+      result = ok(true)
+      return
+
+    if sendRet == avErrorAgain:
       result = ok(true)
       return
 
@@ -498,6 +536,11 @@ proc readFrameInto*(
         return
 
       view = viewRet.value
+      view.timestamp = view.timestamp.withPacketFallback(
+        decoder.popPacketTimestamp(),
+        decoder.frameIndex
+      )
+      inc decoder.frameIndex
       result = ok(true)
       return
 
