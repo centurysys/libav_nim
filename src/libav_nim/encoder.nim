@@ -11,6 +11,13 @@ import ./packet
 import ./types
 
 # =============================================================================
+# === FFmpeg local constants
+# =============================================================================
+
+const
+  avCodecFlagGlobalHeader = 1 shl 22
+
+# =============================================================================
 # === Encoder options
 # =============================================================================
 
@@ -28,6 +35,7 @@ type
     bitRate*: int64
     gopSize*: int
     maxBFrames*: int
+    globalHeader*: bool
     frameAlign*: int
 
 # =============================================================================
@@ -59,6 +67,7 @@ type
     hasPacket*: bool
     flushed*: bool
     packet*: EncodedPacketView
+    avPacket*: AVPacketPtr
 
 # =============================================================================
 # === Internal helpers
@@ -263,6 +272,8 @@ proc openVideoEncoder*(options: VideoEncoderOptions): FFmpegResult[VideoEncoder]
   codecCtx[].bit_rate = options.effectiveBitRate()
   codecCtx[].gop_size = cint(options.effectiveGopSize())
   codecCtx[].max_b_frames = cint(options.maxBFrames)
+  if options.globalHeader:
+    codecCtx[].flags = codecCtx[].flags or avCodecFlagGlobalHeader
 
   let openRet = okAv(avcodec_open2(codecCtx, codec, nil), &"avcodec_open2({encoderName})")
   if openRet.isErr:
@@ -478,5 +489,17 @@ proc receivePacket*(encoder: VideoEncoder): FFmpegResult[EncodedPacketRead] =
   result = ok(EncodedPacketRead(
     hasPacket: true,
     flushed: false,
-    packet: viewRet.value
+    packet: viewRet.value,
+    avPacket: encoder.packet.raw
   ))
+
+# -----------------------------------------------------------------------------
+# --- rawPacket
+# -----------------------------------------------------------------------------
+
+proc rawPacket*(read: EncodedPacketRead): FFmpegResult[AVPacketPtr] =
+  if not read.hasPacket or read.avPacket.isNil:
+    result = fail[AVPacketPtr]("EncodedPacketRead.rawPacket", "No encoded packet is available")
+    return
+
+  result = ok(read.avPacket)
