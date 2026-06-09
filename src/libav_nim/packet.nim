@@ -2,6 +2,7 @@
 #
 # Result-based thin ownership wrapper for AVPacket.
 
+import std/strformat
 import results
 import ./bindings/c_api
 import ./error
@@ -114,3 +115,34 @@ proc packetTimestamp*(packet: Packet; timeBase: Rational): FFmpegResult[FrameTim
     timestamp.source = tsPacketDts
 
   result = ok(timestamp)
+
+# =============================================================================
+# === Borrowed encoded packet view
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# --- toEncodedPacketView
+# -----------------------------------------------------------------------------
+
+proc toEncodedPacketView*(packet: Packet; timeBase: Rational): FFmpegResult[EncodedPacketView] =
+  let rawRet = packet.requireOpen()
+  if rawRet.isErr:
+    result = err(rawRet.error)
+    return
+
+  let raw = rawRet.value
+  if raw[].data.isNil or raw[].size <= 0:
+    result = fail[EncodedPacketView](
+      "toEncodedPacketView",
+      &"Encoded packet has no payload: size={raw[].size}"
+    )
+    return
+
+  result = ok(EncodedPacketView(
+    data: cast[pointer](raw[].data),
+    size: int(raw[].size),
+    pts: raw[].pts,
+    dts: raw[].dts,
+    duration: raw[].duration,
+    timeBase: timeBase
+  ))

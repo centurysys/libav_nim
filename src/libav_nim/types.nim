@@ -351,6 +351,36 @@ type
     timeBase*: Rational
     timestamp*: FrameTimestamp
 
+  WritableI420FrameView* = object
+    ## Borrowed writable view of an encoder-owned YUV420P/I420 frame.
+    ##
+    ## The plane pointers are owned by FFmpeg. They are intended as the target
+    ## for upper-layer RGBX -> I420 conversion before submitFrame(). The view is
+    ## invalid after submitFrame(), encoder close, or frame reuse.
+    width*: int
+    height*: int
+    format*: PixelFormat
+    y*: pointer
+    u*: pointer
+    v*: pointer
+    yStride*: int
+    uStride*: int
+    vStride*: int
+    pts*: int64
+    timeBase*: Rational
+
+  EncodedPacketView* = object
+    ## Borrowed view of one encoded packet.
+    ##
+    ## data is owned by FFmpeg. It is valid only until the owning packet is
+    ## unref'ed/freed or reused by receivePacket().
+    data*: pointer
+    size*: int
+    pts*: int64
+    dts*: int64
+    duration*: int64
+    timeBase*: Rational
+
 # =============================================================================
 # === Borrowed frame view helpers
 # =============================================================================
@@ -423,6 +453,19 @@ proc yuv420Layout*(frame: Yuv420FrameView): Yuv420Layout =
   )
 
 # -----------------------------------------------------------------------------
+# --- yuv420Layout
+# -----------------------------------------------------------------------------
+
+proc yuv420Layout*(frame: WritableI420FrameView): Yuv420Layout =
+  result = yuv420Layout(
+    frame.width,
+    frame.height,
+    frame.yStride,
+    frame.uStride,
+    frame.vStride
+  )
+
+# -----------------------------------------------------------------------------
 # --- yPlane
 # -----------------------------------------------------------------------------
 
@@ -463,6 +506,31 @@ proc vPlane*(frame: Yuv420FrameView): PlaneView =
 # -----------------------------------------------------------------------------
 
 proc hasUsableYuv420Planes*(frame: Yuv420FrameView): bool =
+  if frame.format != pfYuv420p:
+    return false
+
+  if frame.width <= 0 or frame.height <= 0:
+    return false
+
+  if frame.y.isNil or frame.u.isNil or frame.v.isNil:
+    return false
+
+  if frame.yStride < frame.width:
+    return false
+
+  if frame.uStride < ((frame.width + 1) div 2):
+    return false
+
+  if frame.vStride < ((frame.width + 1) div 2):
+    return false
+
+  result = true
+
+# -----------------------------------------------------------------------------
+# --- hasUsableYuv420Planes
+# -----------------------------------------------------------------------------
+
+proc hasUsableYuv420Planes*(frame: WritableI420FrameView): bool =
   if frame.format != pfYuv420p:
     return false
 

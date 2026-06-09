@@ -1,33 +1,35 @@
-# c_api.nim skeleton for the split Futhark output.
-# Place this next to generated/ and adjust import paths as needed.
+# =============================================================================
+# === FFmpeg C API binding include switch
+# =============================================================================
 
-when defined(debianFfmpeg7):
-  const
-    avutilLib* = "libavutil.so.59"
-    avcodecLib* = "libavcodec.so.61"
-    avformatLib* = "libavformat.so.61"
-elif defined(alpineFfmpeg8):
-  const
-    avutilLib* = "libavutil.so.60"
-    avcodecLib* = "libavcodec.so.62"
-    avformatLib* = "libavformat.so.62"
+import ./libnames
+
+when defined(ffmpeg8):
+  include generated/ffmpeg8/ffmpeg_types_gen
+  include generated/ffmpeg8/ffmpeg_consts_gen
+elif defined(ffmpeg7):
+  include generated/ffmpeg7/ffmpeg_types_gen
+  include generated/ffmpeg7/ffmpeg_consts_gen
 else:
-  const
-    avutilLib* = "libavutil.so"
-    avcodecLib* = "libavcodec.so"
-    avformatLib* = "libavformat.so"
-
-include generated/ffmpeg_types_gen
-include generated/ffmpeg_consts_gen
+  {.error: "Define ffmpeg7 or ffmpeg8".}
 
 {.push dynlib: avutilLib.}
-include generated/avutil_api_gen
+when defined(ffmpeg8):
+  include generated/ffmpeg8/avutil_api_gen
+elif defined(ffmpeg7):
+  include generated/ffmpeg7/avutil_api_gen
 {.pop.}
 
 {.push dynlib: avcodecLib.}
-include generated/avcodec_api_gen
+when defined(ffmpeg8):
+  include generated/ffmpeg8/avcodec_api_gen
+elif defined(ffmpeg7):
+  include generated/ffmpeg7/avcodec_api_gen
 {.pop.}
 
 {.push dynlib: avformatLib.}
-include generated/avformat_api_gen
+when defined(ffmpeg8):
+  include generated/ffmpeg8/avformat_api_gen
+elif defined(ffmpeg7):
+  include generated/ffmpeg7/avformat_api_gen
 {.pop.}

@@ -247,3 +247,73 @@ proc toYuv420FrameView*(
     timeBase: timeBase,
     timestamp: timestamp
   ))
+
+# =============================================================================
+# === Writable borrowed I420 view
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# --- toWritableI420FrameView
+# -----------------------------------------------------------------------------
+
+proc toWritableI420FrameView*(
+    frame: Frame;
+    timeBase = Rational(num: 0, den: 1)
+  ): FFmpegResult[WritableI420FrameView] =
+  let rawRet = frame.requireOpen()
+  if rawRet.isErr:
+    result = err(rawRet.error)
+    return
+
+  let raw = rawRet.value
+  let pixelFormat = pixelFormatFromRaw(raw[].format)
+
+  if pixelFormat != pfYuv420p:
+    result = fail[WritableI420FrameView](
+      "toWritableI420FrameView",
+      &"Expected YUV420P frame, got pixel format {pixelFormat}"
+    )
+    return
+
+  if raw[].width <= 0 or raw[].height <= 0:
+    result = fail[WritableI420FrameView](
+      "toWritableI420FrameView",
+      &"Invalid frame size: {raw[].width}x{raw[].height}"
+    )
+    return
+
+  if raw[].data[0].isNil or raw[].data[1].isNil or raw[].data[2].isNil:
+    result = fail[WritableI420FrameView](
+      "toWritableI420FrameView",
+      "YUV420P frame has missing plane pointers"
+    )
+    return
+
+  if raw[].linesize[0] < raw[].width:
+    result = fail[WritableI420FrameView](
+      "toWritableI420FrameView",
+      &"Invalid Y plane stride: {raw[].linesize[0]} for width {raw[].width}"
+    )
+    return
+
+  let chromaWidth = (int(raw[].width) + 1) div 2
+  if int(raw[].linesize[1]) < chromaWidth or int(raw[].linesize[2]) < chromaWidth:
+    result = fail[WritableI420FrameView](
+      "toWritableI420FrameView",
+      &"Invalid chroma stride: U={raw[].linesize[1]} V={raw[].linesize[2]} for chroma width {chromaWidth}"
+    )
+    return
+
+  result = ok(WritableI420FrameView(
+    width: int(raw[].width),
+    height: int(raw[].height),
+    format: pixelFormat,
+    y: cast[pointer](raw[].data[0]),
+    u: cast[pointer](raw[].data[1]),
+    v: cast[pointer](raw[].data[2]),
+    yStride: int(raw[].linesize[0]),
+    uStride: int(raw[].linesize[1]),
+    vStride: int(raw[].linesize[2]),
+    pts: raw[].pts,
+    timeBase: timeBase
+  ))
