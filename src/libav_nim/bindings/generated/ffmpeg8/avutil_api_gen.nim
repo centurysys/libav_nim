@@ -855,30 +855,6 @@ proc av_read_play*(s: ptr AVFormatContext): cint {.cdecl,
 proc av_read_pause*(s: ptr AVFormatContext): cint {.cdecl,
     importc: "av_read_pause".}
 
-proc av_write_frame*(s: ptr AVFormatContext; pkt: ptr AVPacket): cint {.cdecl,
-    importc: "av_write_frame".}
-
-proc av_interleaved_write_frame*(s: ptr AVFormatContext; pkt: ptr AVPacket): cint {.
-    cdecl, importc: "av_interleaved_write_frame".}
-
-proc av_write_uncoded_frame*(s: ptr AVFormatContext; stream_index: cint;
-                             frame: ptr struct_AVFrame): cint {.cdecl,
-    importc: "av_write_uncoded_frame".}
-
-proc av_interleaved_write_uncoded_frame*(s: ptr AVFormatContext;
-    stream_index: cint; frame: ptr struct_AVFrame): cint {.cdecl,
-    importc: "av_interleaved_write_uncoded_frame".}
-
-proc av_write_uncoded_frame_query*(s: ptr AVFormatContext; stream_index: cint): cint {.
-    cdecl, importc: "av_write_uncoded_frame_query".}
-
-proc av_write_trailer*(s: ptr AVFormatContext): cint {.cdecl,
-    importc: "av_write_trailer".}
-
-proc av_get_output_timestamp*(s: ptr struct_AVFormatContext; stream: cint;
-                              dts: ptr int64; wall: ptr int64): cint {.cdecl,
-    importc: "av_get_output_timestamp".}
-
 proc av_hex_dump*(f: ptr FILE; buf: ptr uint8; size: cint): void {.cdecl,
     importc: "av_hex_dump".}
 

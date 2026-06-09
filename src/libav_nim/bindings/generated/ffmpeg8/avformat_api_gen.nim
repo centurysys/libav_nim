@@ -285,6 +285,26 @@ proc avformat_write_header*(s: ptr AVFormatContext;
 proc avformat_init_output*(s: ptr AVFormatContext; options: ptr ptr AVDictionary): cint {.
     cdecl, importc: "avformat_init_output".}
 
+proc av_write_frame*(s: ptr AVFormatContext; pkt: ptr AVPacket): cint {.cdecl,
+    importc: "av_write_frame".}
+
+proc av_interleaved_write_frame*(s: ptr AVFormatContext; pkt: ptr AVPacket): cint {.
+    cdecl, importc: "av_interleaved_write_frame".}
+
+proc av_write_uncoded_frame*(s: ptr AVFormatContext; stream_index: cint;
+                             frame: ptr struct_AVFrame): cint {.cdecl,
+    importc: "av_write_uncoded_frame".}
+
+proc av_interleaved_write_uncoded_frame*(s: ptr AVFormatContext;
+    stream_index: cint; frame: ptr struct_AVFrame): cint {.cdecl,
+    importc: "av_interleaved_write_uncoded_frame".}
+
+proc av_write_uncoded_frame_query*(s: ptr AVFormatContext; stream_index: cint): cint {.
+    cdecl, importc: "av_write_uncoded_frame_query".}
+
+proc av_write_trailer*(s: ptr AVFormatContext): cint {.cdecl,
+    importc: "av_write_trailer".}
+
 proc av_guess_format*(short_name: cstring; filename: cstring; mime_type: cstring): ptr AVOutputFormat {.
     cdecl, importc: "av_guess_format".}
 
@@ -292,6 +312,10 @@ proc av_guess_codec*(fmt: ptr AVOutputFormat; short_name: cstring;
                      filename: cstring; mime_type: cstring;
                      type_arg: enum_AVMediaType): enum_AVCodecID {.cdecl,
     importc: "av_guess_codec".}
+
+proc av_get_output_timestamp*(s: ptr struct_AVFormatContext; stream: cint;
+                              dts: ptr int64; wall: ptr int64): cint {.cdecl,
+    importc: "av_get_output_timestamp".}
 
 proc av_find_default_stream_index*(s: ptr AVFormatContext): cint {.cdecl,
     importc: "av_find_default_stream_index".}
