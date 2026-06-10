@@ -162,6 +162,8 @@ proc rawPixelFormat(format: PixelFormat): FFmpegResult[AVPixelFormat] =
   case format
   of pfYuv420p:
     result = ok(AV_PIX_FMT_YUV420P)
+  of pfNv12:
+    result = ok(AV_PIX_FMT_NV12)
   else:
     result = fail[AVPixelFormat](
       "rawPixelFormat",
@@ -386,6 +388,47 @@ proc beginFrame*(encoder: VideoEncoder; pts: int64): FFmpegResult[WritableI420Fr
   rawRet.value[].pts = pts
 
   let viewRet = encoder.frame.toWritableI420FrameView(encoder.timeBase)
+  if viewRet.isErr:
+    result = err(viewRet.error)
+    return
+
+  encoder.framePrepared = true
+  result = ok(viewRet.value)
+
+# -----------------------------------------------------------------------------
+# --- beginFrameNV12
+# -----------------------------------------------------------------------------
+
+proc beginFrameNV12*(encoder: VideoEncoder; pts: int64): FFmpegResult[WritableNV12FrameView] =
+  let openRet = encoder.requireOpen()
+  if openRet.isErr:
+    result = err(openRet.error)
+    return
+
+  if encoder.flushed:
+    result = fail[WritableNV12FrameView]("beginFrameNV12", "Encoder has already been flushed")
+    return
+
+  if encoder.framePrepared:
+    result = fail[WritableNV12FrameView](
+      "beginFrameNV12",
+      "Previous frame has not been submitted"
+    )
+    return
+
+  let writableRet = encoder.frame.makeWritable()
+  if writableRet.isErr:
+    result = err(writableRet.error)
+    return
+
+  let rawRet = encoder.frame.requireOpen()
+  if rawRet.isErr:
+    result = err(rawRet.error)
+    return
+
+  rawRet.value[].pts = pts
+
+  let viewRet = encoder.frame.toWritableNV12FrameView(encoder.timeBase)
   if viewRet.isErr:
     result = err(viewRet.error)
     return

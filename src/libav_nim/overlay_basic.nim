@@ -5,7 +5,6 @@
 # This module intentionally avoids Pixie.  It is useful for validating the
 # decode -> RGBX -> draw -> encode path and for very small production overlays.
 
-import std/[algorithm, strformat]
 import ./rgbx
 
 # =============================================================================

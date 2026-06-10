@@ -10,3 +10,4 @@ srcDir        = "src"
 # Dependencies
 
 requires "nim >= 2.2.10"
+requires "libyuv_nim >= 0.1.0"
