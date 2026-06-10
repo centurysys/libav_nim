@@ -317,3 +317,70 @@ proc toWritableI420FrameView*(
     pts: raw[].pts,
     timeBase: timeBase
   ))
+
+# =============================================================================
+# === Writable borrowed NV12 view
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# --- toWritableNV12FrameView
+# -----------------------------------------------------------------------------
+
+proc toWritableNV12FrameView*(
+    frame: Frame;
+    timeBase = Rational(num: 0, den: 1)
+  ): FFmpegResult[WritableNV12FrameView] =
+  let rawRet = frame.requireOpen()
+  if rawRet.isErr:
+    result = err(rawRet.error)
+    return
+
+  let raw = rawRet.value
+  let pixelFormat = pixelFormatFromRaw(raw[].format)
+
+  if pixelFormat != pfNv12:
+    result = fail[WritableNV12FrameView](
+      "toWritableNV12FrameView",
+      &"Expected NV12 frame, got pixel format {pixelFormat}"
+    )
+    return
+
+  if raw[].width <= 0 or raw[].height <= 0:
+    result = fail[WritableNV12FrameView](
+      "toWritableNV12FrameView",
+      &"Invalid frame size: {raw[].width}x{raw[].height}"
+    )
+    return
+
+  if raw[].data[0].isNil or raw[].data[1].isNil:
+    result = fail[WritableNV12FrameView](
+      "toWritableNV12FrameView",
+      "NV12 frame has missing plane pointers"
+    )
+    return
+
+  if raw[].linesize[0] < raw[].width:
+    result = fail[WritableNV12FrameView](
+      "toWritableNV12FrameView",
+      &"Invalid Y plane stride: {raw[].linesize[0]} for width {raw[].width}"
+    )
+    return
+
+  if raw[].linesize[1] < raw[].width:
+    result = fail[WritableNV12FrameView](
+      "toWritableNV12FrameView",
+      &"Invalid UV plane stride: {raw[].linesize[1]} for width {raw[].width}"
+    )
+    return
+
+  result = ok(WritableNV12FrameView(
+    width: int(raw[].width),
+    height: int(raw[].height),
+    format: pixelFormat,
+    y: cast[pointer](raw[].data[0]),
+    uv: cast[pointer](raw[].data[1]),
+    yStride: int(raw[].linesize[0]),
+    uvStride: int(raw[].linesize[1]),
+    pts: raw[].pts,
+    timeBase: timeBase
+  ))

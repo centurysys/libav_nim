@@ -369,6 +369,28 @@ type
     pts*: int64
     timeBase*: Rational
 
+  Nv12Layout* = object
+    ## Byte sizes implied by an NV12 frame layout.
+    yBytes*: int
+    uvBytes*: int
+    totalBytes*: int
+
+  WritableNV12FrameView* = object
+    ## Borrowed writable view of an encoder-owned NV12 frame.
+    ##
+    ## NV12 stores the full-size Y plane followed by one interleaved UV plane.
+    ## The UV plane has chroma-height rows and width bytes per visible row.
+    ## The view is invalid after submitFrame(), encoder close, or frame reuse.
+    width*: int
+    height*: int
+    format*: PixelFormat
+    y*: pointer
+    uv*: pointer
+    yStride*: int
+    uvStride*: int
+    pts*: int64
+    timeBase*: Rational
+
   EncodedPacketView* = object
     ## Borrowed view of one encoded packet.
     ##
@@ -466,6 +488,34 @@ proc yuv420Layout*(frame: WritableI420FrameView): Yuv420Layout =
   )
 
 # -----------------------------------------------------------------------------
+# --- nv12Layout
+# -----------------------------------------------------------------------------
+
+proc nv12Layout*(
+    width: int;
+    height: int;
+    yStride: int;
+    uvStride: int
+  ): Nv12Layout =
+  let chromaHeight = (height + 1) div 2
+
+  result.yBytes = planeByteSize(yStride, height)
+  result.uvBytes = planeByteSize(uvStride, chromaHeight)
+  result.totalBytes = result.yBytes + result.uvBytes
+
+# -----------------------------------------------------------------------------
+# --- nv12Layout
+# -----------------------------------------------------------------------------
+
+proc nv12Layout*(frame: WritableNV12FrameView): Nv12Layout =
+  result = nv12Layout(
+    frame.width,
+    frame.height,
+    frame.yStride,
+    frame.uvStride
+  )
+
+# -----------------------------------------------------------------------------
 # --- yPlane
 # -----------------------------------------------------------------------------
 
@@ -547,6 +597,28 @@ proc hasUsableYuv420Planes*(frame: WritableI420FrameView): bool =
     return false
 
   if frame.vStride < ((frame.width + 1) div 2):
+    return false
+
+  result = true
+
+# -----------------------------------------------------------------------------
+# --- hasUsableNv12Planes
+# -----------------------------------------------------------------------------
+
+proc hasUsableNv12Planes*(frame: WritableNV12FrameView): bool =
+  if frame.format != pfNv12:
+    return false
+
+  if frame.width <= 0 or frame.height <= 0:
+    return false
+
+  if frame.y.isNil or frame.uv.isNil:
+    return false
+
+  if frame.yStride < frame.width:
+    return false
+
+  if frame.uvStride < frame.width:
     return false
 
   result = true

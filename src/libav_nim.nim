@@ -10,6 +10,7 @@ import libav_nim/error
 import libav_nim/packet
 import libav_nim/frame
 import libav_nim/i420
+import libav_nim/nv12
 import libav_nim/rgbx
 import libav_nim/overlay_basic
 import libav_nim/decoder
@@ -21,6 +22,7 @@ export error
 export packet
 export frame
 export i420
+export nv12
 export rgbx
 export overlay_basic
 export decoder
