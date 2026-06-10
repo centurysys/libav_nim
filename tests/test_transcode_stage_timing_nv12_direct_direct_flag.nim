@@ -16,6 +16,10 @@ import libav_nim
 # =============================================================================
 
 type
+  DecoderRgbxMode = enum
+    drmOwnedCopy
+    drmDirect
+
   StageStats = object
     calls: int
     totalMs: float
@@ -30,6 +34,7 @@ type
     readFrame: StageStats
     copyDecodedI420ToOwned: StageStats
     copyOwnedI420ToRGBX: StageStats
+    copyDecodedI420ToRGBXDirect: StageStats
     overlay: StageStats
     beginFrameNV12: StageStats
     copyRGBXToNV12Padded: StageStats
@@ -91,10 +96,16 @@ template timeVoid(stats: var StageStats; body: untyped) =
 
 proc usage() =
   echo "usage:"
-  echo "  test_transcode_stage_timing_nv12_direct <input> <output.mp4> [decoder] [encoder] [fps] [bitrate] [maxFrames]"
+  echo "  test_transcode_stage_timing_nv12_direct <input> <output.mp4> [decoder] [encoder] [fps] [bitrate] [maxFrames] [options]"
+  echo ""
+  echo "options:"
+  echo "  --owned-decoder-copy       copy decoder I420 into an owned buffer before RGBX conversion (default)"
+  echo "  --direct-decoder-rgbx      convert decoder I420 buffer directly into RGBX"
+  echo "  --dump-decoder-frame-info  print the first decoded YUV420 frame view information"
+  echo "  --help                    show this help"
   echo ""
   echo "example:"
-  echo "  ./test_transcode_stage_timing_nv12_direct bbb_h265.mp4 out_timing_nv12_direct.mp4 hevc_v4l2m2m h264_v4l2m2m 30 2000000 300"
+  echo "  ./test_transcode_stage_timing_nv12_direct bbb_h265.mp4 out_timing_nv12_direct.mp4 hevc_v4l2m2m h264_v4l2m2m 30 2000000 300 --direct-decoder-rgbx"
 
 # -----------------------------------------------------------------------------
 # --- logStep
@@ -113,6 +124,51 @@ proc parseIntArg(args: seq[string]; index: int; defaultValue: int): int =
     return
 
   result = parseInt(args[index])
+
+# -----------------------------------------------------------------------------
+# --- splitArgs
+# -----------------------------------------------------------------------------
+
+proc splitArgs(args: seq[string]): tuple[positionals: seq[string], flags: seq[string]] =
+  for arg in args:
+    if arg.startsWith("--"):
+      result.flags.add(arg)
+    else:
+      result.positionals.add(arg)
+
+# -----------------------------------------------------------------------------
+# --- hasFlag
+# -----------------------------------------------------------------------------
+
+proc hasFlag(flags: seq[string]; name: string): bool =
+  for flag in flags:
+    if flag == name:
+      return true
+
+  result = false
+
+# -----------------------------------------------------------------------------
+# --- validateFlags
+# -----------------------------------------------------------------------------
+
+proc validateFlags(flags: seq[string]) =
+  for flag in flags:
+    case flag
+    of "--owned-decoder-copy", "--direct-decoder-rgbx", "--dump-decoder-frame-info", "--help":
+      discard
+    else:
+      raise newException(IOError, &"Unknown option: {flag}")
+
+# -----------------------------------------------------------------------------
+# --- decoderRgbxModeName
+# -----------------------------------------------------------------------------
+
+proc decoderRgbxModeName(mode: DecoderRgbxMode): string =
+  case mode
+  of drmOwnedCopy:
+    result = "owned-copy"
+  of drmDirect:
+    result = "direct"
 
 # -----------------------------------------------------------------------------
 # --- alignUp
@@ -188,6 +244,7 @@ proc printTimingSummary(timing: PipelineTiming; frameCount: int; packets: int) =
   printStage("readFrame", timing.readFrame, frameCount)
   printStage("copyDecodedI420ToOwned", timing.copyDecodedI420ToOwned, frameCount)
   printStage("copyOwnedI420ToRGBX", timing.copyOwnedI420ToRGBX, frameCount)
+  printStage("copyDecodedI420ToRGBXDirect", timing.copyDecodedI420ToRGBXDirect, frameCount)
   printStage("overlay", timing.overlay, frameCount)
   printStage("beginFrameNV12", timing.beginFrameNV12, frameCount)
   printStage("copyRGBXToNV12Padded", timing.copyRGBXToNV12Padded, frameCount)
@@ -195,6 +252,66 @@ proc printTimingSummary(timing: PipelineTiming; frameCount: int; packets: int) =
   printStage("drainTotal", timing.drainTotal, frameCount)
   printStage("receivePacket", timing.receivePacket, frameCount)
   printStage("writePacket", timing.writePacket, frameCount)
+
+# -----------------------------------------------------------------------------
+# --- ptrHex
+# -----------------------------------------------------------------------------
+
+proc ptrHex(p: pointer): string =
+  if p.isNil:
+    result = "nil"
+  else:
+    result = "0x" & toHex(cast[uint](p))
+
+# -----------------------------------------------------------------------------
+# --- planeDelta
+# -----------------------------------------------------------------------------
+
+proc planeDelta(base, p: pointer): string =
+  if base.isNil or p.isNil:
+    result = "n/a"
+    return
+
+  let b = cast[uint](base)
+  let x = cast[uint](p)
+  if x >= b:
+    result = &"+{x - b}"
+  else:
+    result = &"-{b - x}"
+
+# -----------------------------------------------------------------------------
+# --- dumpYuv420FrameView
+# -----------------------------------------------------------------------------
+
+proc dumpYuv420FrameView(frame: Yuv420FrameView; label: string) =
+  let chromaH = (frame.height + 1) div 2
+  echo &"[stage-timing-nv12] {label}:"
+  echo "  borrowed Yuv420FrameView:"
+  echo &"    size       : {frame.width}x{frame.height}"
+  echo &"    format     : {frame.format.pixelFormatName()}"
+  echo &"    y          : {ptrHex(frame.y)}"
+  echo &"    u          : {ptrHex(frame.u)}"
+  echo &"    v          : {ptrHex(frame.v)}"
+  echo &"    yStride    : {frame.yStride}"
+  echo &"    uStride    : {frame.uStride}"
+  echo &"    vStride    : {frame.vStride}"
+  echo &"    u-y        : {planeDelta(frame.y, frame.u)}"
+  echo &"    v-y        : {planeDelta(frame.y, frame.v)}"
+  echo &"    v-u        : {planeDelta(frame.u, frame.v)}"
+  echo "    visible byte estimates:"
+  echo &"      Y        : {frame.yStride * frame.height}"
+  echo &"      U        : {frame.uStride * chromaH}"
+  echo &"      V        : {frame.vStride * chromaH}"
+  echo &"      total    : {frame.yStride * frame.height + frame.uStride * chromaH + frame.vStride * chromaH}"
+
+var decoderFrameInfoDumped = false
+
+proc dumpYuv420FrameViewOnce(frame: Yuv420FrameView; label: string) =
+  if decoderFrameInfoDumped:
+    return
+
+  decoderFrameInfoDumped = true
+  dumpYuv420FrameView(frame, label)
 
 # -----------------------------------------------------------------------------
 # --- drainEncoderTimed
@@ -251,10 +368,35 @@ proc encodeRgbxFrameNv12Timed(
 # --- readFrameIntoOwnedAndRgbxTimed
 # -----------------------------------------------------------------------------
 
-proc readFrameIntoOwnedAndRgbxTimed(
+proc convertDecodedFrameToRgbxTimed(
+    frame: Yuv420FrameView;
+    ownedI420: var OwnedI420Frame;
+    rgbx: var OwnedRGBXFrame;
+    mode: DecoderRgbxMode;
+    timing: var PipelineTiming
+  ) =
+  case mode
+  of drmOwnedCopy:
+    timeVoid(timing.copyDecodedI420ToOwned):
+      checkVoid(copyI420(frame, ownedI420))
+
+    timeVoid(timing.copyOwnedI420ToRGBX):
+      checkVoid(copyI420ToRGBX(ownedI420, rgbx))
+
+  of drmDirect:
+    timeVoid(timing.copyDecodedI420ToRGBXDirect):
+      checkVoid(copyI420ToRGBX(frame, rgbx))
+
+# -----------------------------------------------------------------------------
+# --- readFrameIntoRgbxTimed
+# -----------------------------------------------------------------------------
+
+proc readFrameIntoRgbxTimed(
     decoder: VideoDecoder;
     ownedI420: var OwnedI420Frame;
     rgbx: var OwnedRGBXFrame;
+    mode: DecoderRgbxMode;
+    dumpDecoderFrameInfo: bool;
     timing: var PipelineTiming;
     eof: var bool
   ) =
@@ -267,18 +409,28 @@ proc readFrameIntoOwnedAndRgbxTimed(
     return
 
   eof = false
-  timeVoid(timing.copyDecodedI420ToOwned):
-    checkVoid(copyI420(read.frame, ownedI420))
 
-  timeVoid(timing.copyOwnedI420ToRGBX):
-    checkVoid(copyI420ToRGBX(ownedI420, rgbx))
+  if dumpDecoderFrameInfo:
+    dumpYuv420FrameViewOnce(read.frame, "decoded frame before RGBX conversion")
+
+  convertDecodedFrameToRgbxTimed(read.frame, ownedI420, rgbx, mode, timing)
 
 # =============================================================================
 # === main
 # =============================================================================
 
 proc main() =
-  let args = commandLineParams()
+  let rawArgs = commandLineParams()
+  let split = splitArgs(rawArgs)
+  let args = split.positionals
+  let flags = split.flags
+
+  if flags.hasFlag("--help"):
+    usage()
+    quit(0)
+
+  validateFlags(flags)
+
   if args.len < 2:
     usage()
     quit(1)
@@ -290,6 +442,12 @@ proc main() =
   let fps = parseIntArg(args, 4, 30)
   let bitrate = parseIntArg(args, 5, 2_000_000)
   let maxFrames = parseIntArg(args, 6, 0)
+
+  if flags.hasFlag("--owned-decoder-copy") and flags.hasFlag("--direct-decoder-rgbx"):
+    failWith("--owned-decoder-copy and --direct-decoder-rgbx are mutually exclusive")
+
+  let decoderRgbxMode = if flags.hasFlag("--direct-decoder-rgbx"): drmDirect else: drmOwnedCopy
+  let dumpDecoderFrameInfo = flags.hasFlag("--dump-decoder-frame-info")
 
   if fps <= 0:
     failWith(&"Invalid fps: {fps}")
@@ -322,17 +480,17 @@ proc main() =
   let encoderHeight = alignUp(height, 16)
 
   logStep(&"first frame decoded: {width}x{height}")
+  logStep(&"decoder RGBX conversion mode: {decoderRgbxMode.decoderRgbxModeName()}")
   if encoderHeight != height:
     logStep(&"using padded NV12 encoder frame height: visible={height} storage={encoderHeight}")
 
   var ownedI420 = check(newOwnedI420Frame(width, height))
   var rgbx = check(newOwnedRGBXFrame(width, height))
 
-  timeVoid(timing.copyDecodedI420ToOwned):
-    checkVoid(copyI420(firstRead.frame, ownedI420))
+  if dumpDecoderFrameInfo:
+    dumpYuv420FrameViewOnce(firstRead.frame, "first decoded frame before RGBX conversion")
 
-  timeVoid(timing.copyOwnedI420ToRGBX):
-    checkVoid(copyI420ToRGBX(ownedI420, rgbx))
+  convertDecodedFrameToRgbxTimed(firstRead.frame, ownedI420, rgbx, decoderRgbxMode, timing)
 
   logStep(&"owned I420 buffer allocated: {ownedI420.byteSize()} bytes")
   logStep(&"owned RGBX buffer allocated: {rgbx.byteSize()} bytes")
@@ -389,7 +547,15 @@ proc main() =
       logStep(&"reading frame {decodedFrames}")
 
     var eof = false
-    readFrameIntoOwnedAndRgbxTimed(decoder, ownedI420, rgbx, timing, eof)
+    readFrameIntoRgbxTimed(
+      decoder,
+      ownedI420,
+      rgbx,
+      decoderRgbxMode,
+      dumpDecoderFrameInfo,
+      timing,
+      eof
+    )
     if eof:
       logStep("decoder reached EOF")
       break
@@ -429,6 +595,7 @@ proc main() =
   echo &"  decoder      : {decoderName}"
   echo &"  encoder      : {encoderName}"
   echo &"  input format : nv12 (RGBX direct)"
+  echo &"  decoder RGBX : {decoderRgbxMode.decoderRgbxModeName()}"
   echo &"  visible size : {width}x{height}"
   echo &"  encoder size : {width}x{encoderHeight}"
   echo &"  fps          : {fps}"
