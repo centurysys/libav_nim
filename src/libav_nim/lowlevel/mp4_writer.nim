@@ -86,6 +86,60 @@ proc freeContext(writer: Mp4VideoWriter) =
   writer.fmtCtx = nil
   writer.stream = nil
 
+
+# -----------------------------------------------------------------------------
+# --- preparePacketViewForWriting
+# -----------------------------------------------------------------------------
+
+proc preparePacketViewForWriting(
+    writer: Mp4VideoWriter;
+    packet: AVPacketPtr;
+    view: EncodedPacketView
+  ): FFmpegResult[void] =
+  if packet.isNil:
+    result = fail[void]("Mp4VideoWriter.preparePacketViewForWriting", "Temporary packet is nil")
+    return
+
+  if view.size <= 0:
+    result = fail[void](
+      "Mp4VideoWriter.preparePacketViewForWriting",
+      &"Encoded packet has no payload: size={view.size}"
+    )
+    return
+
+  if view.data.isNil:
+    result = fail[void]("Mp4VideoWriter.preparePacketViewForWriting", "Encoded packet payload is nil")
+    return
+
+  packet[].data = cast[ptr uint8](view.data)
+  packet[].size = cint(view.size)
+  packet[].pts = view.pts
+  packet[].dts = view.dts
+  packet[].duration = view.duration
+  packet[].stream_index = writer.stream[].index
+  packet[].flags = 0
+  if view.isKeyframe:
+    packet[].flags = packet[].flags or cint(AV_PKT_FLAG_KEY)
+
+  if packet[].pts == avNoPtsValue:
+    packet[].pts = writer.nextPts
+
+  if packet[].dts == avNoPtsValue:
+    packet[].dts = packet[].pts
+
+  if packet[].duration <= 0:
+    packet[].duration = 1
+
+  writer.nextPts = packet[].pts + packet[].duration
+
+  av_packet_rescale_ts(
+    packet,
+    writer.encoderTimeBase.toAVRational(),
+    writer.stream[].time_base
+  )
+
+  result = ok()
+
 # =============================================================================
 # === MP4 writer lifecycle
 # =============================================================================
@@ -263,3 +317,42 @@ proc writePacket*(writer: Mp4VideoWriter; read: EncodedPacketRead): FFmpegResult
     return
 
   result = ok()
+
+# -----------------------------------------------------------------------------
+# --- writePacket
+# -----------------------------------------------------------------------------
+
+proc writePacket*(writer: Mp4VideoWriter; view: EncodedPacketView): FFmpegResult[void] =
+  ## Write one encoded packet view.
+  ##
+  ## This is intended for packet data owned outside FFmpeg, such as a packet copied
+  ## into an event-recording ring buffer. The view.data memory only has to remain
+  ## valid for the duration of this call.
+  let openRet = writer.requireOpen()
+  if openRet.isErr:
+    result = err(openRet.error)
+    return
+
+  var packet = av_packet_alloc()
+  if packet.isNil:
+    result = fail[void]("av_packet_alloc", "allocation failed")
+    return
+
+  let prepareRet = writer.preparePacketViewForWriting(packet, view)
+  if prepareRet.isErr:
+    av_packet_free(addr packet)
+    result = err(prepareRet.error)
+    return
+
+  let writeRet = okAv(
+    av_interleaved_write_frame(writer.fmtCtx, packet),
+    "av_interleaved_write_frame"
+  )
+  if writeRet.isErr:
+    av_packet_free(addr packet)
+    result = err(writeRet.error)
+    return
+
+  av_packet_free(addr packet)
+  result = ok()
+

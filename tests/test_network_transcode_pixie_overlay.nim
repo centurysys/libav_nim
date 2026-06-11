@@ -47,6 +47,7 @@ type
     receivePacket: StageStats
     writePacket: StageStats
     ringPush: StageStats
+    ringWrite: StageStats
     encoderFlush: StageStats
     writerFinish: StageStats
 
@@ -106,6 +107,7 @@ proc usage() =
   echo "  --ring-seconds=N               keep encoded packets in a time-bounded ring buffer. default: 0 disabled"
   echo "  --ring-max-bytes=N             optional byte limit for the encoded packet ring. default: 0 disabled"
   echo "  --dump-ring-stats              print encoded packet ring statistics at the end"
+  echo "  --ring-output=PATH             write retained ring packets to another MP4 after encoding"
   echo "  --help                         show this help"
   echo ""
   echo "example:"
@@ -169,7 +171,8 @@ proc validateFlags(flags: seq[string]) =
         flag.startsWith("--input-option=") or
         flag.startsWith("--font=") or
         flag.startsWith("--ring-seconds=") or
-        flag.startsWith("--ring-max-bytes="):
+        flag.startsWith("--ring-max-bytes=") or
+        flag.startsWith("--ring-output="):
       continue
 
     raise newException(IOError, &"Unknown option: {flag}")
@@ -260,6 +263,7 @@ proc printTimingSummary(timing: PipelineTiming; frameCount: int; packets: int) =
   printStage("receivePacket", timing.receivePacket, frameCount)
   printStage("writePacket", timing.writePacket, frameCount)
   printStage("ringPush", timing.ringPush, frameCount)
+  printStage("ringWrite", timing.ringWrite, frameCount)
 
 # =============================================================================
 # === Pixie zero-copy move adapter and overlay
@@ -517,6 +521,7 @@ proc main() =
   let ringSeconds = parseIntFlag(flags, "--ring-seconds", 0)
   let ringMaxBytes = parseInt64Flag(flags, "--ring-max-bytes", 0'i64)
   let dumpRingStats = flags.hasFlag("--dump-ring-stats")
+  let ringOutputPath = parseStringFlag(flags, "--ring-output", "")
 
   if maxFrames < 0:
     failWith(&"Invalid frame count: {maxFrames}")
@@ -526,6 +531,8 @@ proc main() =
     failWith(&"Invalid ring seconds: {ringSeconds}")
   if ringMaxBytes < 0:
     failWith(&"Invalid ring max bytes: {ringMaxBytes}")
+  if ringOutputPath.len > 0 and ringSeconds <= 0:
+    failWith("--ring-output requires --ring-seconds=N greater than 0")
 
   var inputOptions: seq[DecoderInputOption]
   if flags.hasFlag("--rtsp-low-latency"):
@@ -573,6 +580,8 @@ proc main() =
     logStep("using RTSP low-latency camera option preset")
   if ringSeconds > 0:
     logStep(&"encoded packet ring enabled: seconds={ringSeconds} maxBytes={ringMaxBytes}")
+  if ringOutputPath.len > 0:
+    logStep(&"ring MP4 output enabled: {ringOutputPath}")
   for item in inputOptions:
     logStep(&"input option: {item.key}={item.value}")
 
@@ -683,6 +692,22 @@ proc main() =
   timeVoid(timing.writerFinish):
     checkVoid(writer.finish())
 
+  var ringOutputPackets = 0
+  if ringOutputPath.len > 0:
+    if packetBuffer.len == 0:
+      failWith("Cannot write ring output: encoded packet ring is empty")
+
+    logStep(&"opening ring MP4 writer: {ringOutputPath}")
+    var ringWriter = check(openMp4VideoWriter(ringOutputPath, encoder))
+    try:
+      let startIndex = packetBuffer.findStartKeyframeIndex(packetBuffer.oldestTimestampUsec())
+      timeVoid(timing.ringWrite):
+        ringOutputPackets = check(ringWriter.writeEncodedPacketBuffer(packetBuffer, startIndex, rebaseTimestamps = true))
+      logStep(&"finishing ring MP4 writer: packets={ringOutputPackets}")
+      checkVoid(ringWriter.finish())
+    finally:
+      ringWriter.close()
+
   let totalMs = nowMs() - totalStartedAt
   let effectiveFps = if totalMs > 0.0: float(decodedFrames) * 1000.0 / totalMs else: 0.0
   let transportName = if rtspTransportTcp: "rtsp-tcp" else: "default"
@@ -707,6 +732,9 @@ proc main() =
     echo &"  ring seconds : {ringSeconds}"
     echo &"  ring maxbytes: {ringMaxBytes}"
     echo &"  ring stats   : {packetBuffer.statsText()}"
+  if ringOutputPath.len > 0:
+    echo &"  ring output  : {ringOutputPath}"
+    echo &"  ring written : {ringOutputPackets}"
   echo &"  i420 bytes   : {ownedI420.byteSize()}"
   echo &"  rgbx bytes   : {rgbx.byteSize()}"
   echo &"  total ms     : {totalMs.formatMs()}"

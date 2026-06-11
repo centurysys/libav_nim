@@ -9,6 +9,8 @@
 import std/[deques, strformat]
 
 import ../lowlevel/types
+import ../lowlevel/error
+import ../lowlevel/mp4_writer
 
 # =============================================================================
 # === Owned encoded packet
@@ -338,3 +340,95 @@ proc statsText*(buf: EncodedPacketBuffer): string =
   result = &"packets={buf.len} bytes={buf.totalBytes} duration_us={buf.durationUsec} keyframes={buf.keyframeCount}"
   if buf.packets.len > 0:
     result.add(&" oldest_us={buf.oldestTimestampUsec} newest_us={buf.newestTimestampUsec}")
+# =============================================================================
+# === MP4 writer helpers
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# --- toEncodedPacketView
+# -----------------------------------------------------------------------------
+
+proc toEncodedPacketView*(
+    pkt: OwnedEncodedPacket;
+    ptsOffset: int64 = 0;
+    dtsOffset: int64 = 0
+  ): EncodedPacketView =
+  ## Create a borrowed view over Nim-owned packet data.
+  ##
+  ## The returned view is valid only while pkt.data is alive and not reallocated.
+  ## ptsOffset/dtsOffset are subtracted before writing, which is useful when a
+  ## clip starts from the middle of a longer packet timeline.
+  if pkt.data.len <= 0:
+    raise newException(ValueError, "Owned encoded packet has no payload")
+
+  result = EncodedPacketView(
+    data: cast[pointer](pkt.data[0].unsafeAddr),
+    size: pkt.data.len,
+    pts: pkt.pts - ptsOffset,
+    dts: pkt.dts - dtsOffset,
+    duration: pkt.duration,
+    isKeyframe: pkt.isKeyframe,
+    timeBase: pkt.timeBase
+  )
+
+# -----------------------------------------------------------------------------
+# --- writeOwnedEncodedPacket
+# -----------------------------------------------------------------------------
+
+proc writeOwnedEncodedPacket*(
+    writer: Mp4VideoWriter;
+    pkt: OwnedEncodedPacket;
+    ptsOffset: int64 = 0;
+    dtsOffset: int64 = 0
+  ): FFmpegResult[void] =
+  ## Write one Nim-owned encoded packet to an MP4 writer.
+  let view = pkt.toEncodedPacketView(ptsOffset, dtsOffset)
+  result = writer.writePacket(view)
+
+# -----------------------------------------------------------------------------
+# --- writeEncodedPacketBuffer
+# -----------------------------------------------------------------------------
+
+proc writeEncodedPacketBuffer*(
+    writer: Mp4VideoWriter;
+    buf: EncodedPacketBuffer;
+    startIndex: int = 0;
+    rebaseTimestamps: bool = true
+  ): FFmpegResult[int] =
+  ## Write retained packets from startIndex to writer.
+  ##
+  ## When rebaseTimestamps is true, the first written packet starts at pts/dts 0.
+  ## Returns the number of packets written.
+  if startIndex < 0 or startIndex >= buf.packets.len:
+    result = ok(0)
+    return
+
+  var ptsOffset = 0'i64
+  var dtsOffset = 0'i64
+  if rebaseTimestamps:
+    var found = false
+    var i = 0
+    for pkt in buf.packets:
+      if i >= startIndex:
+        ptsOffset = pkt.pts
+        dtsOffset = pkt.dts
+        found = true
+        break
+      inc i
+    if not found:
+      result = ok(0)
+      return
+
+  var count = 0
+  var i = 0
+  for pkt in buf.packets:
+    if i >= startIndex:
+      let writeRet = writer.writeOwnedEncodedPacket(pkt, ptsOffset, dtsOffset)
+      if writeRet.isErr:
+        result = err(writeRet.error)
+        return
+      inc count
+    inc i
+
+  result = ok(count)
+
