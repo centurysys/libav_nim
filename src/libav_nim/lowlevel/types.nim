@@ -404,6 +404,22 @@ type
     isKeyframe*: bool
     timeBase*: Rational
 
+  EncodedStreamInfo* = object
+    ## Codec parameters needed to create a new MP4 writer for already-encoded
+    ## packets.
+    ##
+    ## extradata is a Nim-owned copy of FFmpeg codec extradata, if available.
+    ## For H.264 this is expected to contain decoder configuration such as
+    ## SPS/PPS in the format FFmpeg wants for the muxer.
+    codecId*: CodecId
+    width*: int
+    height*: int
+    pixelFormat*: PixelFormat
+    timeBase*: Rational
+    framerate*: Rational
+    bitRate*: int64
+    extradata*: seq[byte]
+
 # =============================================================================
 # === Borrowed frame view helpers
 # =============================================================================

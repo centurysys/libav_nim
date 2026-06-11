@@ -42,6 +42,7 @@ type
     maxDurationUsec*: int64
     maxBytes*: int64
     totalBytes*: int64
+    h264ParameterSetPrefix*: seq[byte]
 
 # =============================================================================
 # === Packet copy helpers
@@ -116,6 +117,106 @@ proc containsH264SpsPps*(data: openArray[byte]): tuple[hasSps: bool, hasPps: boo
   result.hasPps = data.containsH264NalType(8)
 
 # -----------------------------------------------------------------------------
+# --- appendRange
+# -----------------------------------------------------------------------------
+
+proc appendRange(dest: var seq[byte]; src: openArray[byte]; first: int; lastExclusive: int) =
+  if first < 0 or lastExclusive <= first or first >= src.len:
+    return
+
+  let boundedLast = min(lastExclusive, src.len)
+  for i in first ..< boundedLast:
+    dest.add(src[i])
+
+# -----------------------------------------------------------------------------
+# --- startCodeLenAt
+# -----------------------------------------------------------------------------
+
+proc startCodeLenAt(data: openArray[byte]; pos: int): int =
+  ## Return Annex B start-code length at pos, or 0 when no start code exists.
+  if pos < 0 or pos + 3 > data.len:
+    return 0
+
+  if pos + 3 <= data.len and
+      data[pos] == 0'u8 and data[pos + 1] == 0'u8 and data[pos + 2] == 1'u8:
+    return 3
+
+  if pos + 4 <= data.len and
+      data[pos] == 0'u8 and data[pos + 1] == 0'u8 and
+      data[pos + 2] == 0'u8 and data[pos + 3] == 1'u8:
+    return 4
+
+  result = 0
+
+# -----------------------------------------------------------------------------
+# --- findAnnexBStartCode
+# -----------------------------------------------------------------------------
+
+proc findAnnexBStartCode(data: openArray[byte]; startPos: int): int =
+  ## Return the next Annex B start-code index, or -1.
+  var i = max(startPos, 0)
+  while i + 3 <= data.len:
+    if data.startCodeLenAt(i) > 0:
+      return i
+    inc i
+  result = -1
+
+# -----------------------------------------------------------------------------
+# --- extractH264ParameterSetPrefix
+# -----------------------------------------------------------------------------
+
+proc extractH264ParameterSetPrefix*(data: openArray[byte]): seq[byte] =
+  ## Extract H.264 SPS/PPS NAL units as a prefix byte sequence.
+  ##
+  ## The returned byte sequence keeps the original packet framing style:
+  ## Annex B start-code framed input returns Annex B SPS/PPS NALs, while AVCC
+  ## 4-byte length-prefixed input returns length-prefixed SPS/PPS NALs. The
+  ## prefix is intended to be prepended to a later IDR packet when a mid-stream
+  ## MP4 event clip needs decoder configuration but the encoder did not expose
+  ## codec extradata.
+
+  # Annex B: preserve each SPS/PPS NAL with its start code.
+  var pos = data.findAnnexBStartCode(0)
+  while pos >= 0:
+    let scLen = data.startCodeLenAt(pos)
+    let nalStart = pos + scLen
+    if nalStart >= data.len:
+      break
+
+    let nextStart = data.findAnnexBStartCode(nalStart)
+    let nalEnd = if nextStart >= 0: nextStart else: data.len
+    let nalType = int(data[nalStart]) and 0x1f
+    if nalType == 7 or nalType == 8:
+      result.appendRange(data, pos, nalEnd)
+
+    if nextStart < 0:
+      break
+    pos = nextStart
+
+  if result.len > 0:
+    return
+
+  # AVCC-style 4-byte length-prefixed NAL units. Preserve the length prefixes.
+  pos = 0
+  while pos + 4 < data.len:
+    let nalLen =
+      (int(data[pos]) shl 24) or
+      (int(data[pos + 1]) shl 16) or
+      (int(data[pos + 2]) shl 8) or
+      int(data[pos + 3])
+
+    if nalLen <= 0 or pos + 4 + nalLen > data.len:
+      break
+
+    let nalStart = pos + 4
+    let nalEnd = nalStart + nalLen
+    let nalType = int(data[nalStart]) and 0x1f
+    if nalType == 7 or nalType == 8:
+      result.appendRange(data, pos, nalEnd)
+
+    pos = nalEnd
+
+# -----------------------------------------------------------------------------
 # --- copyEncodedPacket
 # -----------------------------------------------------------------------------
 
@@ -162,6 +263,7 @@ proc initEncodedPacketBuffer*(maxDurationUsec: int64; maxBytes: int64 = 0): Enco
   result.maxDurationUsec = maxDurationUsec
   result.maxBytes = maxBytes
   result.totalBytes = 0
+  result.h264ParameterSetPrefix = @[]
   result.packets = initDeque[OwnedEncodedPacket]()
 
 # -----------------------------------------------------------------------------
@@ -171,6 +273,7 @@ proc initEncodedPacketBuffer*(maxDurationUsec: int64; maxBytes: int64 = 0): Enco
 proc clear*(buf: var EncodedPacketBuffer) =
   buf.packets.clear()
   buf.totalBytes = 0
+  buf.h264ParameterSetPrefix = @[]
 
 # -----------------------------------------------------------------------------
 # --- len
@@ -235,6 +338,14 @@ proc h264ParameterSetPacketCount*(buf: EncodedPacketBuffer): int =
   for pkt in buf.packets:
     if pkt.hasH264Sps and pkt.hasH264Pps:
       inc result
+
+# -----------------------------------------------------------------------------
+# --- hasH264ParameterSetPrefix
+# -----------------------------------------------------------------------------
+
+proc hasH264ParameterSetPrefix*(buf: EncodedPacketBuffer): bool =
+  ## Return true when SPS/PPS bytes were captured from the stream.
+  result = buf.h264ParameterSetPrefix.len > 0
 
 # =============================================================================
 # === Trimming
@@ -304,6 +415,11 @@ proc trim*(buf: var EncodedPacketBuffer; nowUsec: int64) =
 proc push*(buf: var EncodedPacketBuffer; pkt: sink OwnedEncodedPacket) =
   ## Add one packet and trim using the packet timestamp as the current time.
   let nowUsec = pkt.timestampUsec
+  if buf.h264ParameterSetPrefix.len == 0:
+    let prefix = pkt.data.extractH264ParameterSetPrefix()
+    if prefix.len > 0:
+      buf.h264ParameterSetPrefix = prefix
+
   buf.totalBytes += pkt.data.len
   buf.packets.addLast(pkt)
   buf.trim(nowUsec)
@@ -316,14 +432,18 @@ proc push*(buf: var EncodedPacketBuffer; pkt: sink OwnedEncodedPacket) =
 # --- findStartKeyframeIndex
 # -----------------------------------------------------------------------------
 
-proc findStartKeyframeIndex*(buf: EncodedPacketBuffer; desiredStartUsec: int64): int =
+proc findStartKeyframeIndex*(
+    buf: EncodedPacketBuffer;
+    desiredStartUsec: int64;
+    requireParameterSets: bool = true
+  ): int =
   ## Find a safe event clip start at or before desiredStartUsec.
   ##
-  ## Prefer the last keyframe that also carries H.264 SPS/PPS at or before the
-  ## requested start. Starting a new MP4 clip from a later IDR-only packet can be
-  ## invalid with some hardware encoders because the mid-stream clip has no
-  ## decoder configuration. If no such self-contained keyframe exists, fall back
-  ## to the last keyframe, then to packet 0.
+  ## When requireParameterSets is true, prefer the last keyframe that also carries
+  ## H.264 SPS/PPS at or before the requested start. This is the safe fallback for
+  ## writers that do not have codec extradata. When a caller opens the writer from
+  ## copied extradata, requireParameterSets can be false so an IDR-only keyframe
+  ## near the requested start can be used.
   ##
   ## Returns 0 when the buffer has packets but no earlier keyframe was found.
   ## Returns -1 when the buffer is empty.
@@ -340,8 +460,10 @@ proc findStartKeyframeIndex*(buf: EncodedPacketBuffer; desiredStartUsec: int64):
         selfContainedKeyframe = i
     inc i
 
-  if selfContainedKeyframe >= 0:
+  if requireParameterSets and selfContainedKeyframe >= 0:
     result = selfContainedKeyframe
+  elif requireParameterSets and fallbackKeyframe >= 0 and selfContainedKeyframe < 0:
+    result = fallbackKeyframe
   elif fallbackKeyframe >= 0:
     result = fallbackKeyframe
   else:
@@ -416,7 +538,7 @@ iterator iterPacketsFrom*(buf: EncodedPacketBuffer; startIndex: int): OwnedEncod
 # -----------------------------------------------------------------------------
 
 proc statsText*(buf: EncodedPacketBuffer): string =
-  result = &"packets={buf.len} bytes={buf.totalBytes} duration_us={buf.durationUsec} keyframes={buf.keyframeCount} h264_spspps={buf.h264ParameterSetPacketCount}"
+  result = &"packets={buf.len} bytes={buf.totalBytes} duration_us={buf.durationUsec} keyframes={buf.keyframeCount} h264_spspps={buf.h264ParameterSetPacketCount} h264_ps_prefix={buf.h264ParameterSetPrefix.len}"
   if buf.packets.len > 0:
     result.add(&" oldest_us={buf.oldestTimestampUsec} newest_us={buf.newestTimestampUsec}")
 # =============================================================================
@@ -451,6 +573,33 @@ proc toEncodedPacketView*(
   )
 
 # -----------------------------------------------------------------------------
+# --- withH264ParameterSetPrefix
+# -----------------------------------------------------------------------------
+
+proc withH264ParameterSetPrefix*(pkt: OwnedEncodedPacket; prefix: openArray[byte]): OwnedEncodedPacket =
+  ## Return pkt with SPS/PPS prefix prepended when pkt is not already self-contained.
+  ##
+  ## This is a pragmatic fallback for hardware encoders that put SPS/PPS only in
+  ## the first packet and expose no codec extradata. The event clip can then
+  ## start from a later IDR packet while still carrying decoder configuration in
+  ## its first sample.
+  result = pkt
+  if prefix.len == 0 or (pkt.hasH264Sps and pkt.hasH264Pps):
+    return
+
+  result.data = newSeq[byte](prefix.len + pkt.data.len)
+  for i in 0 ..< prefix.len:
+    result.data[i] = prefix[i]
+  for i in 0 ..< pkt.data.len:
+    result.data[prefix.len + i] = pkt.data[i]
+
+  let h264ParamSets = result.data.containsH264SpsPps()
+  result.hasH264Sps = h264ParamSets.hasSps
+  result.hasH264Pps = h264ParamSets.hasPps
+  if not result.isKeyframe and result.data.containsH264IdrNal():
+    result.isKeyframe = true
+
+# -----------------------------------------------------------------------------
 # --- writeOwnedEncodedPacket
 # -----------------------------------------------------------------------------
 
@@ -473,11 +622,14 @@ proc writeEncodedPacketBufferRange*(
     buf: EncodedPacketBuffer;
     startIndex: int;
     endIndexExclusive: int;
-    rebaseTimestamps: bool = true
+    rebaseTimestamps: bool = true;
+    prependH264ParameterSets: bool = false
   ): FFmpegResult[int] =
   ## Write retained packets in [startIndex, endIndexExclusive) to writer.
   ##
   ## When rebaseTimestamps is true, the first written packet starts at pts/dts 0.
+  ## When prependH264ParameterSets is true, the first written packet is prefixed
+  ## with captured SPS/PPS bytes if it does not already contain them.
   ## Returns the number of packets written.
   if startIndex < 0 or startIndex >= buf.packets.len:
     result = ok(0)
@@ -508,7 +660,11 @@ proc writeEncodedPacketBufferRange*(
   var i = 0
   for pkt in buf.packets:
     if i >= startIndex and i < boundedEnd:
-      let writeRet = writer.writeOwnedEncodedPacket(pkt, ptsOffset, dtsOffset)
+      var packetToWrite = pkt
+      if i == startIndex and prependH264ParameterSets:
+        packetToWrite = pkt.withH264ParameterSetPrefix(buf.h264ParameterSetPrefix)
+
+      let writeRet = writer.writeOwnedEncodedPacket(packetToWrite, ptsOffset, dtsOffset)
       if writeRet.isErr:
         result = err(writeRet.error)
         return

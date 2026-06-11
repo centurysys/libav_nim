@@ -350,6 +350,38 @@ proc requireOpen*(encoder: VideoEncoder): FFmpegResult[AVCodecContextPtr] =
 
   result = ok(encoder.codecCtx)
 
+# -----------------------------------------------------------------------------
+# --- encodedStreamInfo
+# -----------------------------------------------------------------------------
+
+proc encodedStreamInfo*(encoder: VideoEncoder): FFmpegResult[EncodedStreamInfo] =
+  ## Copy codec parameters that are needed to create a later MP4 writer for
+  ## already-encoded packets.
+  ##
+  ## This is intentionally a byte-preserving copy for extradata. It does not
+  ## attempt to parse or regenerate H.264 SPS/PPS.
+  let codecCtxRet = encoder.requireOpen()
+  if codecCtxRet.isErr:
+    result = err(codecCtxRet.error)
+    return
+
+  let codecCtx = codecCtxRet.value
+  var extra = newSeq[byte]()
+  if codecCtx[].extradata_size > 0 and not codecCtx[].extradata.isNil:
+    extra = newSeq[byte](int(codecCtx[].extradata_size))
+    copyMem(extra[0].addr, codecCtx[].extradata, extra.len)
+
+  result = ok(EncodedStreamInfo(
+    codecId: codecCtx[].codec_id.toCodecId(),
+    width: int(codecCtx[].width),
+    height: int(codecCtx[].height),
+    pixelFormat: codecCtx[].pix_fmt.toPixelFormat(),
+    timeBase: codecCtx[].time_base.toRational(),
+    framerate: codecCtx[].framerate.toRational(),
+    bitRate: codecCtx[].bit_rate,
+    extradata: extra
+  ))
+
 # =============================================================================
 # === Frame submission
 # =============================================================================

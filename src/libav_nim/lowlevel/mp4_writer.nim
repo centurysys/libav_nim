@@ -88,6 +88,107 @@ proc freeContext(writer: Mp4VideoWriter) =
 
 
 # -----------------------------------------------------------------------------
+# --- toRawCodecId
+# -----------------------------------------------------------------------------
+
+proc toRawCodecId(codecId: CodecId): AVCodecID =
+  case codecId
+  of cidH264:
+    result = AV_CODEC_ID_H264
+  of cidHevc:
+    result = AV_CODEC_ID_HEVC
+  of cidRawVideo:
+    result = AV_CODEC_ID_RAWVIDEO
+  else:
+    result = AV_CODEC_ID_NONE
+
+# -----------------------------------------------------------------------------
+# --- toRawPixelFormatValue
+# -----------------------------------------------------------------------------
+
+proc toRawPixelFormatValue(format: PixelFormat): cint =
+  case format
+  of pfYuv420p:
+    result = cint(AV_PIX_FMT_YUV420P)
+  of pfNv12:
+    result = cint(AV_PIX_FMT_NV12)
+  of pfNv21:
+    result = cint(AV_PIX_FMT_NV21)
+  of pfRgb24:
+    result = cint(AV_PIX_FMT_RGB24)
+  of pfRgba:
+    result = cint(AV_PIX_FMT_RGBA)
+  of pfBgra:
+    result = cint(AV_PIX_FMT_BGRA)
+  of pfRgbx:
+    result = cint(AV_PIX_FMT_RGB0)
+  of pfBgrx:
+    result = cint(AV_PIX_FMT_BGR0)
+  else:
+    result = -1
+
+# -----------------------------------------------------------------------------
+# --- copyExtradata
+# -----------------------------------------------------------------------------
+
+proc copyExtradata(codecpar: AVCodecParametersPtr; extradata: openArray[byte]): FFmpegResult[void] =
+  if codecpar.isNil:
+    result = fail[void]("copyExtradata", "codec parameters are nil")
+    return
+
+  if extradata.len <= 0:
+    result = ok()
+    return
+
+  let allocSize = extradata.len + AV_INPUT_BUFFER_PADDING_SIZE
+  let mem = av_mallocz(csize_t(allocSize))
+  if mem.isNil:
+    result = fail[void]("av_mallocz", &"allocation failed for extradata: {extradata.len} bytes")
+    return
+
+  copyMem(mem, unsafeAddr extradata[0], extradata.len)
+  codecpar[].extradata = cast[ptr uint8](mem)
+  codecpar[].extradata_size = cint(extradata.len)
+  result = ok()
+
+# -----------------------------------------------------------------------------
+# --- configureStreamFromInfo
+# -----------------------------------------------------------------------------
+
+proc configureStreamFromInfo(
+    stream: AVStreamPtr;
+    info: EncodedStreamInfo
+  ): FFmpegResult[void] =
+  if stream.isNil or stream[].codecpar.isNil:
+    result = fail[void]("configureStreamFromInfo", "stream or codec parameters are nil")
+    return
+
+  if info.codecId == cidUnknown:
+    result = fail[void]("configureStreamFromInfo", "encoded stream codec id is unknown")
+    return
+
+  if info.width <= 0 or info.height <= 0:
+    result = fail[void]("configureStreamFromInfo", &"invalid encoded stream size: {info.width}x{info.height}")
+    return
+
+  let codecpar = stream[].codecpar
+  codecpar[].codec_type = AVMEDIA_TYPE_VIDEO
+  codecpar[].codec_id = info.codecId.toRawCodecId()
+  codecpar[].width = cint(info.width)
+  codecpar[].height = cint(info.height)
+  codecpar[].format = info.pixelFormat.toRawPixelFormatValue()
+  codecpar[].bit_rate = info.bitRate
+  codecpar[].framerate = info.framerate.toAVRational()
+  stream[].time_base = info.timeBase.toAVRational()
+
+  let extraRet = codecpar.copyExtradata(info.extradata)
+  if extraRet.isErr:
+    result = err(extraRet.error)
+    return
+
+  result = ok()
+
+# -----------------------------------------------------------------------------
 # --- preparePacketViewForWriting
 # -----------------------------------------------------------------------------
 
@@ -213,6 +314,77 @@ proc openMp4VideoWriter*(path: string; encoder: VideoEncoder): FFmpegResult[Mp4V
     stream: stream,
     path: path,
     encoderTimeBase: encoder.timeBase,
+    nextPts: 0,
+    headerWritten: true,
+    trailerWritten: false,
+    closed: false
+  ))
+
+# -----------------------------------------------------------------------------
+# --- openMp4VideoWriter
+# -----------------------------------------------------------------------------
+
+proc openMp4VideoWriter*(path: string; streamInfo: EncodedStreamInfo): FFmpegResult[Mp4VideoWriter] =
+  ## Open an MP4 writer using copied codec parameters rather than a live encoder.
+  ##
+  ## This is used when already-encoded packets are written later, for example
+  ## from an event-recording packet ring.
+  if path.len == 0:
+    result = fail[Mp4VideoWriter]("openMp4VideoWriter", "Output path is empty")
+    return
+
+  if not streamInfo.timeBase.isValid():
+    result = fail[Mp4VideoWriter]("openMp4VideoWriter", "Encoded stream time_base is invalid")
+    return
+
+  var fmtCtx: AVFormatContextPtr = nil
+  let allocRet = okAv(
+    avformat_alloc_output_context2(addr fmtCtx, nil, "mp4", path.cstring),
+    &"avformat_alloc_output_context2({path})"
+  )
+  if allocRet.isErr:
+    result = err(allocRet.error)
+    return
+
+  if fmtCtx.isNil:
+    result = fail[Mp4VideoWriter]("avformat_alloc_output_context2", "allocation failed")
+    return
+
+  let stream = avformat_new_stream(fmtCtx, nil)
+  if stream.isNil:
+    avformat_free_context(fmtCtx)
+    result = fail[Mp4VideoWriter]("avformat_new_stream", "allocation failed")
+    return
+
+  let configRet = stream.configureStreamFromInfo(streamInfo)
+  if configRet.isErr:
+    avformat_free_context(fmtCtx)
+    result = err(configRet.error)
+    return
+
+  if not fmtCtx.hasNoFileFlag():
+    let ioRet = okAv(
+      avio_open(addr fmtCtx[].pb, path.cstring, AVIO_FLAG_WRITE),
+      &"avio_open({path})"
+    )
+    if ioRet.isErr:
+      avformat_free_context(fmtCtx)
+      result = err(ioRet.error)
+      return
+
+  let headerRet = okAv(avformat_write_header(fmtCtx, nil), "avformat_write_header")
+  if headerRet.isErr:
+    if not fmtCtx.hasNoFileFlag() and not fmtCtx[].pb.isNil:
+      discard avio_closep(addr fmtCtx[].pb)
+    avformat_free_context(fmtCtx)
+    result = err(headerRet.error)
+    return
+
+  result = ok(Mp4VideoWriter(
+    fmtCtx: fmtCtx,
+    stream: stream,
+    path: path,
+    encoderTimeBase: streamInfo.timeBase,
     nextPts: 0,
     headerWritten: true,
     trailerWritten: false,

@@ -147,4 +147,61 @@ block event_start_prefers_sps_pps_keyframe:
   buf.push(later)
   doAssert buf.findStartKeyframeIndex(4_500_000) == 4
 
+
+block h264_parameter_set_prefix_is_extracted_and_stored:
+  var payload = @[
+    0'u8, 0'u8, 0'u8, 1'u8, 0x67'u8, 0x01'u8, 0x02'u8,
+    0'u8, 0'u8, 0'u8, 1'u8, 0x68'u8, 0x03'u8,
+    0'u8, 0'u8, 0'u8, 1'u8, 0x65'u8, 0x04'u8, 0x05'u8
+  ]
+  let view = EncodedPacketView(
+    data: cast[pointer](payload[0].addr),
+    size: payload.len,
+    pts: 0,
+    dts: 0,
+    duration: 1,
+    timeBase: Rational(num: 1, den: 1_000_000),
+    isKeyframe: false
+  )
+
+  let pkt = copyEncodedPacket(view, 0)
+  doAssert pkt.isKeyframe
+  doAssert pkt.hasH264Sps
+  doAssert pkt.hasH264Pps
+
+  let prefix = extractH264ParameterSetPrefix(pkt.data)
+  doAssert prefix.len > 0
+  doAssert containsH264NalType(prefix, 7)
+  doAssert containsH264NalType(prefix, 8)
+  doAssert not containsH264NalType(prefix, 5)
+
+  var buf = initEncodedPacketBuffer(maxDurationUsec = 10_000_000)
+  buf.push(pkt)
+  doAssert buf.hasH264ParameterSetPrefix()
+  doAssert buf.h264ParameterSetPrefix.len == prefix.len
+
+block h264_parameter_set_prefix_can_be_prepended_to_later_idr:
+  var idr = OwnedEncodedPacket(
+    data: @[0'u8, 0'u8, 0'u8, 1'u8, 0x65'u8, 0x04'u8, 0x05'u8],
+    pts: 2_000_000,
+    dts: 2_000_000,
+    duration: 1,
+    timeBase: Rational(num: 1, den: 1_000_000),
+    isKeyframe: true,
+    hasH264Sps: false,
+    hasH264Pps: false,
+    timestampUsec: 2_000_000
+  )
+  let prefix = @[
+    0'u8, 0'u8, 0'u8, 1'u8, 0x67'u8, 0x01'u8, 0x02'u8,
+    0'u8, 0'u8, 0'u8, 1'u8, 0x68'u8, 0x03'u8
+  ]
+
+  let selfContained = idr.withH264ParameterSetPrefix(prefix)
+  doAssert selfContained.isKeyframe
+  doAssert selfContained.hasH264Sps
+  doAssert selfContained.hasH264Pps
+  doAssert containsH264NalType(selfContained.data, 5)
+  doAssert selfContained.data.len == prefix.len + idr.data.len
+
 echo "test_encoded_packet_buffer: OK"

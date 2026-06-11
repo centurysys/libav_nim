@@ -670,6 +670,9 @@ proc main() =
     logStep("closing encoder")
     encoder.close()
 
+  let encodedStreamInfo = check(encoder.encodedStreamInfo())
+  logStep(&"encoder stream info: codec={encodedStreamInfo.codecId} size={encodedStreamInfo.width}x{encodedStreamInfo.height} time_base={encodedStreamInfo.timeBase.num}/{encodedStreamInfo.timeBase.den} extradata={encodedStreamInfo.extradata.len} bytes")
+
   logStep(&"opening MP4 writer: {outputPath}")
   var writer: Mp4VideoWriter
   timeVoid(timing.writerOpen):
@@ -724,7 +727,7 @@ proc main() =
       failWith("Cannot write ring output: encoded packet ring is empty")
 
     logStep(&"opening ring MP4 writer: {ringOutputPath}")
-    var ringWriter = check(openMp4VideoWriter(ringOutputPath, encoder))
+    var ringWriter = check(openMp4VideoWriter(ringOutputPath, encodedStreamInfo))
     try:
       let startIndex = packetBuffer.findStartKeyframeIndex(packetBuffer.oldestTimestampUsec())
       timeVoid(timing.ringWrite):
@@ -750,21 +753,29 @@ proc main() =
       eventStartUsec = 0
     eventEndUsec = eventUsec + int64(postSeconds) * 1_000_000'i64
 
-    eventStartIndex = packetBuffer.findStartKeyframeIndex(eventStartUsec)
+    let eventWriterHasExtradata = encodedStreamInfo.extradata.len > 0
+    let eventCanPrependH264ParameterSets =
+      encodedStreamInfo.extradata.len == 0 and packetBuffer.hasH264ParameterSetPrefix()
+    let eventHasDecoderHeader = eventWriterHasExtradata or eventCanPrependH264ParameterSets
+    eventStartIndex = packetBuffer.findStartKeyframeIndex(
+      eventStartUsec,
+      requireParameterSets = not eventHasDecoderHeader
+    )
     eventEndIndex = packetBuffer.findEndPacketIndex(eventEndUsec)
     if eventStartIndex < 0 or eventEndIndex <= eventStartIndex:
       failWith(&"Cannot write event output: no packets for event window start_us={eventStartUsec} end_us={eventEndUsec}")
 
     eventActualStartUsec = packetBuffer.packetTimestampUsecAt(eventStartIndex)
-    logStep(&"opening event MP4 writer: {eventOutputPath} startIndex={eventStartIndex} endIndex={eventEndIndex} requested={eventStartUsec}..{eventEndUsec} actualStart={eventActualStartUsec}")
-    var eventWriter = check(openMp4VideoWriter(eventOutputPath, encoder))
+    logStep(&"opening event MP4 writer: {eventOutputPath} startIndex={eventStartIndex} endIndex={eventEndIndex} requested={eventStartUsec}..{eventEndUsec} actualStart={eventActualStartUsec} extradata={encodedStreamInfo.extradata.len} prependSpsPps={eventCanPrependH264ParameterSets}")
+    var eventWriter = check(openMp4VideoWriter(eventOutputPath, encodedStreamInfo))
     try:
       timeVoid(timing.eventWrite):
         eventWrittenPackets = check(eventWriter.writeEncodedPacketBufferRange(
           packetBuffer,
           eventStartIndex,
           eventEndIndex,
-          rebaseTimestamps = true
+          rebaseTimestamps = true,
+          prependH264ParameterSets = eventCanPrependH264ParameterSets
         ))
       logStep(&"finishing event MP4 writer: packets={eventWrittenPackets}")
       checkVoid(eventWriter.finish())
@@ -787,6 +798,7 @@ proc main() =
   echo &"  encoder size : {width}x{encoderHeight}"
   echo &"  nominal fps  : {fps.rateText()}"
   echo &"  bitrate      : {bitrate}"
+  echo &"  extradata    : {encodedStreamInfo.extradata.len} bytes"
   echo &"  frames       : {decodedFrames}"
   echo &"  packets      : {packets}"
   echo &"  packet bytes : {packetBytes}"
@@ -804,6 +816,7 @@ proc main() =
     echo &"  event post   : {postSeconds}"
     echo &"  event request: {eventStartUsec}..{eventEndUsec}"
     echo &"  event actual : start_us={eventActualStartUsec} start_index={eventStartIndex} end_index={eventEndIndex}"
+    echo &"  event header : extradata={encodedStreamInfo.extradata.len} h264_ps_prefix={packetBuffer.h264ParameterSetPrefix.len} prepend_spspps={encodedStreamInfo.extradata.len == 0 and packetBuffer.hasH264ParameterSetPrefix()} require_spspps={encodedStreamInfo.extradata.len == 0 and not packetBuffer.hasH264ParameterSetPrefix()}"
     echo &"  event output : {eventOutputPath}"
     echo &"  event written: {eventWrittenPackets}"
   echo &"  i420 bytes   : {ownedI420.byteSize()}"
