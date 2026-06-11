@@ -105,6 +105,7 @@ proc usage() =
   echo "  --direct-decoder-rgbx          convert decoder I420 buffer directly into RGBX (default)"
   echo "  --font=PATH                    optional TrueType/OpenType font for Pixie text overlay"
   echo "  --no-text                      draw Pixie boxes only, even if --font is given"
+  echo "  --overlay-sweep-seconds=N      seconds for the main detection box to sweep from top-left to bottom-right. default: 8"
   echo "  --ring-seconds=N               keep encoded packets in a time-bounded ring buffer. default: 0 disabled"
   echo "  --ring-max-bytes=N             optional byte limit for the encoded packet ring. default: 0 disabled"
   echo "  --dump-ring-stats              print encoded packet ring statistics at the end"
@@ -178,6 +179,7 @@ proc validateFlags(flags: seq[string]) =
         flag.startsWith("--fflags=") or
         flag.startsWith("--input-option=") or
         flag.startsWith("--font=") or
+        flag.startsWith("--overlay-sweep-seconds=") or
         flag.startsWith("--ring-seconds=") or
         flag.startsWith("--ring-max-bytes=") or
         flag.startsWith("--ring-output=") or
@@ -383,7 +385,8 @@ proc drawPixieOverlay(
     maxFrames: int;
     fps: VideoRate;
     font: Font;
-    drawText: bool
+    drawText: bool;
+    overlaySweepSeconds: int
   ) =
   var target = moveRgbxDataToPixieImage(frame)
 
@@ -391,16 +394,22 @@ proc drawPixieOverlay(
     let ctx = newContext(target)
     let w = float32(target.width)
     let h = float32(target.height)
-    let pulse = float32((frameIndex * 7) mod 120)
-    let movingX = 80.0'f32 + pulse
-    let movingY = 90.0'f32 + float32((frameIndex * 3) mod 60)
+    let boxW = 430.0'f32
+    let boxH = 270.0'f32
+    let marginX = 64.0'f32
+    let marginY = 124.0'f32
+    let sweepFps = max(0.1, fps.rateFloat())
+    let sweepFrames = max(2, int(round(float(max(1, overlaySweepSeconds)) * sweepFps)))
+    let sweepPhase = float32(frameIndex mod sweepFrames) / float32(sweepFrames - 1)
+    let movingX = marginX + max(0.0'f32, w - boxW - marginX * 2.0'f32) * sweepPhase
+    let movingY = marginY + max(0.0'f32, h - boxH - marginY - 80.0'f32) * sweepPhase
 
     # Semi-transparent status panel.
     ctx.fillRoundedRect(18, 18, 520, 92, 14, rgba(0, 0, 0, 120))
     ctx.fillRoundedRect(24, 24, 508, 80, 10, rgba(0, 80, 180, 70))
 
     # Detection-like boxes drawn through Pixie.
-    ctx.drawCornerBox(movingX, movingY, 430, 270, 5, rgba(0, 255, 80, 230))
+    ctx.drawCornerBox(movingX, movingY, boxW, boxH, 5, rgba(0, 255, 80, 230))
     ctx.drawBox(w - 560, h - 420, 420, 300, 4, rgba(255, 64, 64, 230))
     ctx.fillRoundedRect(w - 560, h - 454, 260, 34, 8, rgba(255, 64, 64, 150))
 
@@ -428,6 +437,15 @@ proc drawPixieOverlay(
       target.fillText(
         overlayFont.typeset("Pixie zero-copy overlay", bounds = vec2(260, 28)),
         translate(vec2(w - 548, h - 448))
+      )
+
+      overlayFont.size = 18
+      overlayFont.paint.color = color(0.85, 1, 0.9, 1)
+      let sweepPercent = formatFloat(float(sweepPhase * 100.0'f32), ffDecimal, 1)
+      let sweepText = &"Sweep {overlaySweepSeconds}s  phase={sweepPercent}%"
+      target.fillText(
+        overlayFont.typeset(sweepText, bounds = vec2(320, 28)),
+        translate(vec2(34.0'f32, 74.0'f32))
       )
   finally:
     movePixieImageDataBack(target, frame)
@@ -564,6 +582,7 @@ proc main() =
   let decoderRgbxMode = if flags.hasFlag("--owned-decoder-copy"): drmOwnedCopy else: drmDirect
   let fontPath = parseStringFlag(flags, "--font", "")
   let drawText = not flags.hasFlag("--no-text")
+  let overlaySweepSeconds = parseIntFlag(flags, "--overlay-sweep-seconds", 8)
   let ringSeconds = parseIntFlag(flags, "--ring-seconds", 0)
   let ringMaxBytes = parseInt64Flag(flags, "--ring-max-bytes", 0'i64)
   let dumpRingStats = flags.hasFlag("--dump-ring-stats")
@@ -580,6 +599,8 @@ proc main() =
     failWith(&"Invalid frame count: {maxFrames}")
   if bitrate <= 0:
     failWith(&"Invalid bitrate: {bitrate}")
+  if overlaySweepSeconds <= 0:
+    failWith(&"Invalid overlay sweep seconds: {overlaySweepSeconds}")
   if ringSeconds < 0:
     failWith(&"Invalid ring seconds: {ringSeconds}")
   if ringMaxBytes < 0:
@@ -745,7 +766,7 @@ proc main() =
 
   logStep("drawing and encoding first frame")
   timeVoid(timing.pixieOverlay):
-    drawPixieOverlay(rgbx, decodedFrames, maxFrames, fps, font, drawText)
+    drawPixieOverlay(rgbx, decodedFrames, maxFrames, fps, font, drawText, overlaySweepSeconds)
   encodeRgbxFrameNv12Timed(encoder, writer, rgbx, int64(decodedFrames), timing, packets, packetBytes, packetBuffer, enablePacketRing, fps)
   let firstFrameUsec = fps.timestampUsecForFrame(int64(decodedFrames))
   while eventNextFrameIndex < eventFrames.len and decodedFrames >= eventFrames[eventNextFrameIndex]:
@@ -787,7 +808,7 @@ proc main() =
       break
 
     timeVoid(timing.pixieOverlay):
-      drawPixieOverlay(rgbx, decodedFrames, maxFrames, fps, font, drawText)
+      drawPixieOverlay(rgbx, decodedFrames, maxFrames, fps, font, drawText, overlaySweepSeconds)
 
     encodeRgbxFrameNv12Timed(encoder, writer, rgbx, int64(decodedFrames), timing, packets, packetBytes, packetBuffer, enablePacketRing, fps)
     let frameUsec = fps.timestampUsecForFrame(int64(decodedFrames))
@@ -881,6 +902,7 @@ proc main() =
   echo &"  frames       : {decodedFrames}"
   echo &"  packets      : {packets}"
   echo &"  packet bytes : {packetBytes}"
+  echo &"  overlay sweep: {overlaySweepSeconds}"
   if enablePacketRing or dumpRingStats:
     echo &"  ring enabled : {enablePacketRing}"
     echo &"  ring seconds : {ringSeconds}"
