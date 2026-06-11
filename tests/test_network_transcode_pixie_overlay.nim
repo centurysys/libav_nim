@@ -136,25 +136,6 @@ proc flagValues(flags: seq[string]; prefix: string): seq[string] =
     if flag.startsWith(marker):
       result.add(flag[marker.len .. ^1])
 
-proc parseInputOption(value: string): DecoderInputOption =
-  let sep = value.find('=')
-  if sep <= 0 or sep >= value.len - 1:
-    raise newException(IOError, &"Invalid --input-option value: {value}. Expected KEY=VALUE")
-  result = (key: value[0 ..< sep], value: value[sep + 1 .. ^1])
-
-proc setInputOption(options: var seq[DecoderInputOption]; key, value: string) =
-  for item in options.mitems:
-    if item.key == key:
-      item.value = value
-      return
-  options.add((key: key, value: value))
-
-proc addRtspLowLatencyOptions(options: var seq[DecoderInputOption]) =
-  options.setInputOption("allowed_media_types", "video")
-  options.setInputOption("analyzeduration", "0")
-  options.setInputOption("probesize", "32")
-  options.setInputOption("fpsprobesize", "0")
-  options.setInputOption("fflags", "nobuffer")
 
 proc validateFlags(flags: seq[string]) =
   for flag in flags:

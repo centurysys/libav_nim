@@ -165,44 +165,6 @@ proc flagValues(flags: seq[string]; prefix: string): seq[string] =
       result.add(flag[marker.len .. ^1])
 
 # -----------------------------------------------------------------------------
-# --- parseInputOption
-# -----------------------------------------------------------------------------
-
-proc parseInputOption(value: string): DecoderInputOption =
-  let sep = value.find('=')
-  if sep <= 0 or sep >= value.len - 1:
-    raise newException(IOError, &"Invalid --input-option value: {value}. Expected KEY=VALUE")
-
-  result = (key: value[0 ..< sep], value: value[sep + 1 .. ^1])
-
-# -----------------------------------------------------------------------------
-# --- setInputOption
-# -----------------------------------------------------------------------------
-
-proc setInputOption(options: var seq[DecoderInputOption]; key, value: string) =
-  ## Add an input option, replacing an earlier option with the same key.
-  ## This mirrors av_dict_set() behavior and keeps the printed option list clear.
-  for item in options.mitems:
-    if item.key == key:
-      item.value = value
-      return
-
-  options.add((key: key, value: value))
-
-# -----------------------------------------------------------------------------
-# --- addRtspLowLatencyOptions
-# -----------------------------------------------------------------------------
-
-proc addRtspLowLatencyOptions(options: var seq[DecoderInputOption]) =
-  ## Options that worked well for RTSP camera probing in this test program.
-  ## Do not set codec-level options here; these are passed to avformat_open_input().
-  options.setInputOption("allowed_media_types", "video")
-  options.setInputOption("analyzeduration", "0")
-  options.setInputOption("probesize", "32")
-  options.setInputOption("fpsprobesize", "0")
-  options.setInputOption("fflags", "nobuffer")
-
-# -----------------------------------------------------------------------------
 # --- validateFlags
 # -----------------------------------------------------------------------------
 
