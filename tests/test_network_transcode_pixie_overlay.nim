@@ -8,7 +8,7 @@
 # frames to match an inferred source frame rate. The output PTS/fps is supplied
 # by the caller with --fps.
 
-import std/[math, os, strformat, strutils, times]
+import std/[os, strformat, strutils, times]
 
 import pixie
 import chroma
@@ -23,10 +23,6 @@ type
   DecoderRgbxMode = enum
     drmOwnedCopy
     drmDirect
-
-  VideoRate = object
-    num: int32
-    den: int32
 
   StageStats = object
     calls: int
@@ -208,44 +204,15 @@ proc parseStringFlag(flags: seq[string]; name, defaultValue: string): string =
     return defaultValue
   result = value.value
 
-proc parseVideoRate(text: string): VideoRate =
-  let slash = text.find('/')
-  if slash >= 0:
-    if slash == 0 or slash >= text.len - 1:
-      raise newException(IOError, &"Invalid fps value: {text}")
-    result = VideoRate(
-      num: int32(parseInt(text[0 ..< slash])),
-      den: int32(parseInt(text[slash + 1 .. ^1]))
-    )
-  else:
-    result = VideoRate(num: int32(parseInt(text)), den: 1)
-
-  if result.num <= 0 or result.den <= 0:
-    raise newException(IOError, &"Invalid fps value: {text}")
-
 proc parseVideoRateFlag(flags: seq[string]; name: string; defaultValue: VideoRate): VideoRate =
   let value = flags.flagValue(name)
   if not value.found:
     return defaultValue
-  result = parseVideoRate(value.value)
 
-proc rateText(rate: VideoRate): string =
-  if rate.den == 1:
-    result = $rate.num
-  else:
-    result = &"{rate.num}/{rate.den}"
-
-proc rateFloat(rate: VideoRate): float =
-  result = float(rate.num) / float(rate.den)
-
-proc timeBase(rate: VideoRate): Rational =
-  result = Rational(num: rate.den, den: rate.num)
-
-proc frameRate(rate: VideoRate): Rational =
-  result = Rational(num: rate.num, den: rate.den)
-
-proc gopSize(rate: VideoRate): int =
-  result = max(1, int((rate.num + rate.den - 1) div rate.den))
+  try:
+    result = parseVideoRate(value.value)
+  except ValueError as e:
+    raise newException(IOError, e.msg)
 
 proc decoderRgbxModeName(mode: DecoderRgbxMode): string =
   case mode
@@ -540,7 +507,7 @@ proc main() =
   let decoderName = parseStringFlag(flags, "--decoder", "h264_v4l2m2m")
   let encoderName = parseStringFlag(flags, "--encoder", "h264_v4l2m2m")
   let maxFrames = parseIntFlag(flags, "--frames", 300)
-  let fps = parseVideoRateFlag(flags, "--fps", VideoRate(num: 20, den: 1))
+  let fps = parseVideoRateFlag(flags, "--fps", initVideoRate(20))
   let bitrate = parseIntFlag(flags, "--bitrate", 2_000_000)
   let rtspTransportTcp = flags.hasFlag("--tcp")
   let timeoutUsec = parseInt64Flag(flags, "--timeout-usec", 0'i64)
