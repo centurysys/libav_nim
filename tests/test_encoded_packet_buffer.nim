@@ -13,17 +13,23 @@ proc makePacket(timestampUsec: int64; isKeyframe: bool; size = 10): OwnedEncoded
     timestampUsec: timestampUsec
   )
 
-block initial_non_keyframes_are_dropped:
+block leading_non_keyframes_are_kept_until_keyframe_arrives:
   var buf = initEncodedPacketBuffer(maxDurationUsec = 5_000_000)
   buf.push(makePacket(0, false))
-  doAssert buf.len == 0
+  buf.push(makePacket(500_000, false))
+
+  doAssert buf.len == 2
+  doAssert buf.keyframeCount == 0
+  doAssert buf.totalBytes == 20
 
   buf.push(makePacket(1_000_000, true))
   buf.push(makePacket(2_000_000, false))
+
   doAssert buf.len == 2
   doAssert buf.totalBytes == 20
   doAssert buf.oldestTimestampUsec == 1_000_000
   doAssert buf.keyframeCount == 1
+  doAssert buf.packets.peekFirst().isKeyframe
 
 block trim_keeps_front_on_keyframe:
   var buf = initEncodedPacketBuffer(maxDurationUsec = 3_000_000)
@@ -56,3 +62,33 @@ block max_bytes_trims:
 
   doAssert buf.totalBytes <= 25
   doAssert buf.packets.peekFirst().isKeyframe
+
+block h264_idr_annexb_marks_keyframe:
+  var payload = @[0'u8, 0'u8, 0'u8, 1'u8, 0x65'u8, 0x88'u8, 0x99'u8]
+  let view = EncodedPacketView(
+    data: cast[pointer](payload[0].addr),
+    size: payload.len,
+    pts: 0,
+    dts: 0,
+    duration: 1,
+    timeBase: Rational(num: 1, den: 1_000_000),
+    isKeyframe: false
+  )
+
+  let pkt = copyEncodedPacket(view, 0)
+  doAssert pkt.isKeyframe
+
+block h264_idr_avcc_marks_keyframe:
+  var payload = @[0'u8, 0'u8, 0'u8, 3'u8, 0x65'u8, 0x88'u8, 0x99'u8]
+  let view = EncodedPacketView(
+    data: cast[pointer](payload[0].addr),
+    size: payload.len,
+    pts: 0,
+    dts: 0,
+    duration: 1,
+    timeBase: Rational(num: 1, den: 1_000_000),
+    isKeyframe: false
+  )
+
+  let pkt = copyEncodedPacket(view, 0)
+  doAssert pkt.isKeyframe

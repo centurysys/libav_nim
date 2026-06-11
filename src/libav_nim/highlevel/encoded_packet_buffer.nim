@@ -44,6 +44,57 @@ type
 # =============================================================================
 
 # -----------------------------------------------------------------------------
+# --- containsH264IdrNal
+# -----------------------------------------------------------------------------
+
+proc containsH264IdrNal*(data: openArray[byte]): bool =
+  ## Return true when data appears to contain an H.264 IDR NAL unit.
+  ##
+  ## Some hardware encoders do not reliably propagate AV_PKT_FLAG_KEY on the
+  ## packet wrapper. Event recording still needs a keyframe marker, so this
+  ## provides a conservative H.264 payload fallback for both Annex B start-code
+  ## packets and 4-byte length-prefixed packets.
+
+  # Annex B: 00 00 01 xx or 00 00 00 01 xx
+  var i = 0
+  while i + 3 < data.len:
+    if data[i] == 0'u8 and data[i + 1] == 0'u8:
+      var nalIndex = -1
+      if data[i + 2] == 1'u8:
+        nalIndex = i + 3
+      elif i + 4 < data.len and data[i + 2] == 0'u8 and data[i + 3] == 1'u8:
+        nalIndex = i + 4
+
+      if nalIndex >= 0 and nalIndex < data.len:
+        let nalType = int(data[nalIndex]) and 0x1f
+        if nalType == 5:
+          return true
+        i = nalIndex + 1
+        continue
+
+    inc i
+
+  # AVCC-style 4-byte length prefixed NAL units.
+  var pos = 0
+  while pos + 4 < data.len:
+    let nalLen =
+      (int(data[pos]) shl 24) or
+      (int(data[pos + 1]) shl 16) or
+      (int(data[pos + 2]) shl 8) or
+      int(data[pos + 3])
+
+    if nalLen <= 0 or pos + 4 + nalLen > data.len:
+      break
+
+    let nalType = int(data[pos + 4]) and 0x1f
+    if nalType == 5:
+      return true
+
+    pos += 4 + nalLen
+
+  result = false
+
+# -----------------------------------------------------------------------------
 # --- copyEncodedPacket
 # -----------------------------------------------------------------------------
 
@@ -66,6 +117,9 @@ proc copyEncodedPacket*(view: EncodedPacketView; timestampUsec: int64): OwnedEnc
     if view.data.isNil:
       raise newException(ValueError, "Encoded packet has nil data")
     copyMem(result.data[0].addr, view.data, view.size)
+
+  if not result.isKeyframe and result.data.containsH264IdrNal():
+    result.isKeyframe = true
 
 # =============================================================================
 # === Buffer construction / state
@@ -162,11 +216,29 @@ proc popOldest(buf: var EncodedPacketBuffer) =
     buf.totalBytes = 0
 
 # -----------------------------------------------------------------------------
+# --- hasKeyframe
+# -----------------------------------------------------------------------------
+
+proc hasKeyframe*(buf: EncodedPacketBuffer): bool =
+  ## Return true when the current retained window contains at least one keyframe.
+  for pkt in buf.packets:
+    if pkt.isKeyframe:
+      return true
+  result = false
+
+# -----------------------------------------------------------------------------
 # --- trimLeadingNonKeyframes
 # -----------------------------------------------------------------------------
 
 proc trimLeadingNonKeyframes*(buf: var EncodedPacketBuffer) =
-  ## Drop leading non-keyframes so a retained window starts decodably.
+  ## Drop leading non-keyframes once a keyframe exists in the retained window.
+  ##
+  ## If no keyframe is present yet, keep the packets for diagnostics and for
+  ## encoders that do not mark keyframes correctly. Once a keyframe arrives,
+  ## earlier non-decodable packets are removed and the front is aligned.
+  if not buf.hasKeyframe():
+    return
+
   while buf.packets.len > 0 and not buf.packets.peekFirst().isKeyframe:
     buf.popOldest()
 

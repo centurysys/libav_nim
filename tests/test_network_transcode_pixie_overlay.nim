@@ -46,6 +46,7 @@ type
     drainTotal: StageStats
     receivePacket: StageStats
     writePacket: StageStats
+    ringPush: StageStats
     encoderFlush: StageStats
     writerFinish: StageStats
 
@@ -102,6 +103,9 @@ proc usage() =
   echo "  --direct-decoder-rgbx          convert decoder I420 buffer directly into RGBX (default)"
   echo "  --font=PATH                    optional TrueType/OpenType font for Pixie text overlay"
   echo "  --no-text                      draw Pixie boxes only, even if --font is given"
+  echo "  --ring-seconds=N               keep encoded packets in a time-bounded ring buffer. default: 0 disabled"
+  echo "  --ring-max-bytes=N             optional byte limit for the encoded packet ring. default: 0 disabled"
+  echo "  --dump-ring-stats              print encoded packet ring statistics at the end"
   echo "  --help                         show this help"
   echo ""
   echo "example:"
@@ -147,6 +151,7 @@ proc validateFlags(flags: seq[string]) =
       "--owned-decoder-copy",
       "--direct-decoder-rgbx",
       "--no-text",
+      "--dump-ring-stats",
       "--help"
     ]:
       continue
@@ -162,7 +167,9 @@ proc validateFlags(flags: seq[string]) =
         flag.startsWith("--fpsprobesize=") or
         flag.startsWith("--fflags=") or
         flag.startsWith("--input-option=") or
-        flag.startsWith("--font="):
+        flag.startsWith("--font=") or
+        flag.startsWith("--ring-seconds=") or
+        flag.startsWith("--ring-max-bytes="):
       continue
 
     raise newException(IOError, &"Unknown option: {flag}")
@@ -252,6 +259,7 @@ proc printTimingSummary(timing: PipelineTiming; frameCount: int; packets: int) =
   printStage("drainTotal", timing.drainTotal, frameCount)
   printStage("receivePacket", timing.receivePacket, frameCount)
   printStage("writePacket", timing.writePacket, frameCount)
+  printStage("ringPush", timing.ringPush, frameCount)
 
 # =============================================================================
 # === Pixie zero-copy move adapter and overlay
@@ -419,7 +427,10 @@ proc drainEncoderTimed(
     writer: Mp4VideoWriter;
     timing: var PipelineTiming;
     packets: var int;
-    packetBytes: var int64
+    packetBytes: var int64;
+    packetBuffer: var EncodedPacketBuffer;
+    enablePacketRing: bool;
+    fps: VideoRate
   ) =
   timeVoid(timing.drainTotal):
     while true:
@@ -433,6 +444,11 @@ proc drainEncoderTimed(
       inc packets
       packetBytes += packetRead.packet.size
 
+      if enablePacketRing:
+        let timestampUsec = fps.timestampUsecForFrame(packetRead.packet.pts)
+        timeVoid(timing.ringPush):
+          packetBuffer.push(copyEncodedPacket(packetRead.packet, timestampUsec))
+
       timeVoid(timing.writePacket):
         checkVoid(writer.writePacket(packetRead))
 
@@ -443,7 +459,10 @@ proc encodeRgbxFrameNv12Timed(
     frameIndex: int64;
     timing: var PipelineTiming;
     packets: var int;
-    packetBytes: var int64
+    packetBytes: var int64;
+    packetBuffer: var EncodedPacketBuffer;
+    enablePacketRing: bool;
+    fps: VideoRate
   ) =
   var writable: WritableNV12FrameView
   timeVoid(timing.beginFrameNV12):
@@ -455,7 +474,7 @@ proc encodeRgbxFrameNv12Timed(
   timeVoid(timing.submitFrame):
     checkVoid(encoder.submitFrame())
 
-  drainEncoderTimed(encoder, writer, timing, packets, packetBytes)
+  drainEncoderTimed(encoder, writer, timing, packets, packetBytes, packetBuffer, enablePacketRing, fps)
 
 # =============================================================================
 # === main
@@ -495,11 +514,18 @@ proc main() =
   let decoderRgbxMode = if flags.hasFlag("--owned-decoder-copy"): drmOwnedCopy else: drmDirect
   let fontPath = parseStringFlag(flags, "--font", "")
   let drawText = not flags.hasFlag("--no-text")
+  let ringSeconds = parseIntFlag(flags, "--ring-seconds", 0)
+  let ringMaxBytes = parseInt64Flag(flags, "--ring-max-bytes", 0'i64)
+  let dumpRingStats = flags.hasFlag("--dump-ring-stats")
 
   if maxFrames < 0:
     failWith(&"Invalid frame count: {maxFrames}")
   if bitrate <= 0:
     failWith(&"Invalid bitrate: {bitrate}")
+  if ringSeconds < 0:
+    failWith(&"Invalid ring seconds: {ringSeconds}")
+  if ringMaxBytes < 0:
+    failWith(&"Invalid ring max bytes: {ringMaxBytes}")
 
   var inputOptions: seq[DecoderInputOption]
   if flags.hasFlag("--rtsp-low-latency"):
@@ -545,6 +571,8 @@ proc main() =
     logStep(&"using input timeout: {timeoutUsec} usec")
   if flags.hasFlag("--rtsp-low-latency"):
     logStep("using RTSP low-latency camera option preset")
+  if ringSeconds > 0:
+    logStep(&"encoded packet ring enabled: seconds={ringSeconds} maxBytes={ringMaxBytes}")
   for item in inputOptions:
     logStep(&"input option: {item.key}={item.value}")
 
@@ -618,11 +646,13 @@ proc main() =
   var decodedFrames = 0
   var packets = 0
   var packetBytes = 0'i64
+  let enablePacketRing = ringSeconds > 0
+  var packetBuffer = initEncodedPacketBuffer(int64(ringSeconds) * 1_000_000'i64, ringMaxBytes)
 
   logStep("drawing and encoding first frame")
   timeVoid(timing.pixieOverlay):
     drawPixieOverlay(rgbx, decodedFrames, maxFrames, fps, font, drawText)
-  encodeRgbxFrameNv12Timed(encoder, writer, rgbx, int64(decodedFrames), timing, packets, packetBytes)
+  encodeRgbxFrameNv12Timed(encoder, writer, rgbx, int64(decodedFrames), timing, packets, packetBytes, packetBuffer, enablePacketRing, fps)
   inc decodedFrames
 
   var eof = false
@@ -641,13 +671,13 @@ proc main() =
     timeVoid(timing.pixieOverlay):
       drawPixieOverlay(rgbx, decodedFrames, maxFrames, fps, font, drawText)
 
-    encodeRgbxFrameNv12Timed(encoder, writer, rgbx, int64(decodedFrames), timing, packets, packetBytes)
+    encodeRgbxFrameNv12Timed(encoder, writer, rgbx, int64(decodedFrames), timing, packets, packetBytes, packetBuffer, enablePacketRing, fps)
     inc decodedFrames
 
   logStep("flushing encoder")
   timeVoid(timing.encoderFlush):
     checkVoid(encoder.flush())
-  drainEncoderTimed(encoder, writer, timing, packets, packetBytes)
+  drainEncoderTimed(encoder, writer, timing, packets, packetBytes, packetBuffer, enablePacketRing, fps)
 
   logStep("finishing MP4 writer")
   timeVoid(timing.writerFinish):
@@ -672,6 +702,11 @@ proc main() =
   echo &"  frames       : {decodedFrames}"
   echo &"  packets      : {packets}"
   echo &"  packet bytes : {packetBytes}"
+  if enablePacketRing or dumpRingStats:
+    echo &"  ring enabled : {enablePacketRing}"
+    echo &"  ring seconds : {ringSeconds}"
+    echo &"  ring maxbytes: {ringMaxBytes}"
+    echo &"  ring stats   : {packetBuffer.statsText()}"
   echo &"  i420 bytes   : {ownedI420.byteSize()}"
   echo &"  rgbx bytes   : {rgbx.byteSize()}"
   echo &"  total ms     : {totalMs.formatMs()}"
