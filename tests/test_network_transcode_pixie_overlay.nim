@@ -496,7 +496,7 @@ proc drainEncoderTimed(
     timing: var PipelineTiming;
     packets: var int;
     packetBytes: var int64;
-    packetBuffer: var EncodedPacketBuffer;
+    packetBuffer: EncodedPacketBuffer;
     enablePacketRing: bool;
     fps: VideoRate
   ) =
@@ -528,7 +528,7 @@ proc encodeRgbxFrameNv12Timed(
     timing: var PipelineTiming;
     packets: var int;
     packetBytes: var int64;
-    packetBuffer: var EncodedPacketBuffer;
+    packetBuffer: EncodedPacketBuffer;
     enablePacketRing: bool;
     fps: VideoRate
   ) =
@@ -755,10 +755,10 @@ proc main() =
   var packets = 0
   var packetBytes = 0'i64
   let enablePacketRing = ringSeconds > 0
-  var packetBuffer = initEncodedPacketBuffer(int64(ringSeconds) * 1_000_000'i64, ringMaxBytes)
+  let packetBuffer = newEncodedPacketBuffer(int64(ringSeconds) * 1_000_000'i64, ringMaxBytes)
 
   let recorderOutputPattern = if eventFrames.len > 1: eventOutputPattern else: eventOutputPath
-  var eventRecorder = initEventRecorder(preSeconds, postSeconds, recorderOutputPattern, maxClipSeconds)
+  let eventRecorder = newEventRecorder(preSeconds, postSeconds, recorderOutputPattern, maxClipSeconds)
   var eventClips: seq[EventClipResult]
   var eventNextFrameIndex = 0
   var eventTriggerCount = 0

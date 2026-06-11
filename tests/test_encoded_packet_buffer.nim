@@ -14,7 +14,7 @@ proc makePacket(timestampUsec: int64; isKeyframe: bool; size = 10): OwnedEncoded
   )
 
 block leading_non_keyframes_are_kept_until_keyframe_arrives:
-  var buf = initEncodedPacketBuffer(maxDurationUsec = 5_000_000)
+  let buf = newEncodedPacketBuffer(maxDurationUsec = 5_000_000)
   buf.push(makePacket(0, false))
   buf.push(makePacket(500_000, false))
 
@@ -32,7 +32,7 @@ block leading_non_keyframes_are_kept_until_keyframe_arrives:
   doAssert buf.packets.peekFirst().isKeyframe
 
 block trim_keeps_front_on_keyframe:
-  var buf = initEncodedPacketBuffer(maxDurationUsec = 3_000_000)
+  let buf = newEncodedPacketBuffer(maxDurationUsec = 3_000_000)
   buf.push(makePacket(0, true))
   buf.push(makePacket(1_000_000, false))
   buf.push(makePacket(2_000_000, true))
@@ -44,7 +44,7 @@ block trim_keeps_front_on_keyframe:
   doAssert buf.packets.peekFirst().isKeyframe
 
 block find_start_keyframe:
-  var buf = initEncodedPacketBuffer(maxDurationUsec = 10_000_000)
+  let buf = newEncodedPacketBuffer(maxDurationUsec = 10_000_000)
   buf.push(makePacket(0, true))
   buf.push(makePacket(1_000_000, false))
   buf.push(makePacket(2_000_000, true))
@@ -56,7 +56,7 @@ block find_start_keyframe:
 
 
 block find_event_window_end_index:
-  var buf = initEncodedPacketBuffer(maxDurationUsec = 10_000_000)
+  let buf = newEncodedPacketBuffer(maxDurationUsec = 10_000_000)
   buf.push(makePacket(0, true))
   buf.push(makePacket(1_000_000, false))
   buf.push(makePacket(2_000_000, true))
@@ -69,7 +69,7 @@ block find_event_window_end_index:
   doAssert buf.packetTimestampUsecAt(-1) == 0
 
 block max_bytes_trims:
-  var buf = initEncodedPacketBuffer(maxDurationUsec = 0, maxBytes = 25)
+  let buf = newEncodedPacketBuffer(maxDurationUsec = 0, maxBytes = 25)
   buf.push(makePacket(0, true, 10))
   buf.push(makePacket(1_000_000, false, 10))
   buf.push(makePacket(2_000_000, true, 10))
@@ -129,7 +129,7 @@ block h264_sps_pps_avcc_is_recorded:
   doAssert pkt.hasH264Pps
 
 block event_start_prefers_sps_pps_keyframe:
-  var buf = initEncodedPacketBuffer(maxDurationUsec = 10_000_000)
+  let buf = newEncodedPacketBuffer(maxDurationUsec = 10_000_000)
 
   var first = makePacket(0, true)
   first.hasH264Sps = true
@@ -175,7 +175,7 @@ block h264_parameter_set_prefix_is_extracted_and_stored:
   doAssert containsH264NalType(prefix, 8)
   doAssert not containsH264NalType(prefix, 5)
 
-  var buf = initEncodedPacketBuffer(maxDurationUsec = 10_000_000)
+  let buf = newEncodedPacketBuffer(maxDurationUsec = 10_000_000)
   buf.push(pkt)
   doAssert buf.hasH264ParameterSetPrefix()
   doAssert buf.h264ParameterSetPrefix.len == prefix.len

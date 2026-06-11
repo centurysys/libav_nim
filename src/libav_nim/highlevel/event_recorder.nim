@@ -63,7 +63,7 @@ type
     clipped*: bool
     outputPath*: string
 
-  EventRecorder* = object
+  EventRecorder* = ref object
     options*: EventRecorderOptions
     nextIndex*: int
     state*: EventRecorderState
@@ -128,6 +128,13 @@ proc initEventRecorderOptionsUsec*(
   )
 
 proc initEventRecorder*(options: EventRecorderOptions): EventRecorder =
+  ## Create an EventRecorder instance.
+  ##
+  ## EventRecorder is a ref object so it can be passed around cheaply without
+  ## copying recorder state.  The recorder itself is not synchronized; keep it
+  ## owned by one worker/thread and send trigger requests to that owner when a
+  ## multithreaded pipeline is used.
+  new(result)
   result.options = options
   result.nextIndex = 1
   result.state = ersIdle
@@ -142,6 +149,19 @@ proc initEventRecorder*(
     maxClipSeconds: int = 60
   ): EventRecorder =
   result = initEventRecorder(initEventRecorderOptions(preSeconds, postSeconds, outputPattern, maxClipSeconds))
+
+proc newEventRecorder*(options: EventRecorderOptions): EventRecorder =
+  ## Alias for initEventRecorder(), for ref-object style call sites.
+  result = initEventRecorder(options)
+
+proc newEventRecorder*(
+    preSeconds: int = 10;
+    postSeconds: int = 5;
+    outputPattern: string = "event_$1.mp4";
+    maxClipSeconds: int = 60
+  ): EventRecorder =
+  ## Alias for initEventRecorder(), for ref-object style call sites.
+  result = initEventRecorder(preSeconds, postSeconds, outputPattern, maxClipSeconds)
 
 # =============================================================================
 # === Output path helpers
@@ -252,7 +272,7 @@ proc planEventClip*(
 # === Realtime trigger state
 # =============================================================================
 
-proc clearPending*(recorder: var EventRecorder) =
+proc clearPending*(recorder: EventRecorder) =
   ## Clear any pending realtime event recording window.
   recorder.state = ersIdle
   recorder.pendingEventUsec = 0
@@ -277,7 +297,7 @@ proc maxRecordUntilUsecFor*(recorder: EventRecorder; firstEventUsec: int64): int
   result = startUsec + recorder.options.maxClipUsec
 
 proc trigger*(
-    recorder: var EventRecorder;
+    recorder: EventRecorder;
     eventUsec: int64;
     outputPath: string = ""
   ): EventTriggerResult =
@@ -348,7 +368,7 @@ proc readyToFinalize*(recorder: EventRecorder; buffer: EncodedPacketBuffer): boo
 # =============================================================================
 
 proc writePlannedClip(
-    recorder: var EventRecorder;
+    recorder: EventRecorder;
     buffer: EncodedPacketBuffer;
     streamInfo: EncodedStreamInfo;
     clip: var EventClipResult
@@ -381,7 +401,7 @@ proc writePlannedClip(
   result = ok(clip)
 
 proc writeEventClip*(
-    recorder: var EventRecorder;
+    recorder: EventRecorder;
     buffer: EncodedPacketBuffer;
     streamInfo: EncodedStreamInfo;
     eventUsec: int64;
@@ -402,7 +422,7 @@ proc writeEventClip*(
   result = recorder.writePlannedClip(buffer, streamInfo, clip)
 
 proc writePendingClip*(
-    recorder: var EventRecorder;
+    recorder: EventRecorder;
     buffer: EncodedPacketBuffer;
     streamInfo: EncodedStreamInfo
   ): FFmpegResult[EventClipResult] =

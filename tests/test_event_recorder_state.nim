@@ -5,7 +5,7 @@
 import libav_nim
 
 proc main() =
-  var recorder = initEventRecorder(preSeconds = 3, postSeconds = 2, maxClipSeconds = 8, outputPattern = "event_$1.mp4")
+  let recorder = newEventRecorder(preSeconds = 3, postSeconds = 2, maxClipSeconds = 8, outputPattern = "event_$1.mp4")
 
   doAssert recorder.state == ersIdle
   doAssert not recorder.hasPendingEvent()

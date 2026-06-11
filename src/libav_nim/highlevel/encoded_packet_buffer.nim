@@ -33,8 +33,13 @@ type
     hasH264Pps*: bool
     timestampUsec*: int64
 
-  EncodedPacketBuffer* = object
+  EncodedPacketBuffer* = ref object
     ## Time/size bounded packet deque.
+    ##
+    ## This is a stateful high-level component. It is a ref object so callers can
+    ## pass the buffer around cheaply without copying retained packet state. The
+    ## buffer is not internally synchronized; keep one instance owned by a single
+    ## pipeline/worker thread.
     ##
     ## After trimming, the first retained packet is kept on a keyframe boundary
     ## whenever possible. This makes later MP4 event clip generation simpler.
@@ -252,25 +257,31 @@ proc copyEncodedPacket*(view: EncodedPacketView; timestampUsec: int64): OwnedEnc
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# --- initEncodedPacketBuffer
+# --- newEncodedPacketBuffer / initEncodedPacketBuffer
 # -----------------------------------------------------------------------------
 
-proc initEncodedPacketBuffer*(maxDurationUsec: int64; maxBytes: int64 = 0): EncodedPacketBuffer =
+proc newEncodedPacketBuffer*(maxDurationUsec: int64; maxBytes: int64 = 0): EncodedPacketBuffer =
   ## Create a packet buffer.
   ##
   ## maxDurationUsec <= 0 disables time-based trimming.
   ## maxBytes <= 0 disables byte-size trimming.
-  result.maxDurationUsec = maxDurationUsec
-  result.maxBytes = maxBytes
-  result.totalBytes = 0
-  result.h264ParameterSetPrefix = @[]
-  result.packets = initDeque[OwnedEncodedPacket]()
+  result = EncodedPacketBuffer(
+    maxDurationUsec: maxDurationUsec,
+    maxBytes: maxBytes,
+    totalBytes: 0,
+    h264ParameterSetPrefix: @[],
+    packets: initDeque[OwnedEncodedPacket]()
+  )
+
+proc initEncodedPacketBuffer*(maxDurationUsec: int64; maxBytes: int64 = 0): EncodedPacketBuffer =
+  ## Compatibility alias for newEncodedPacketBuffer().
+  result = newEncodedPacketBuffer(maxDurationUsec, maxBytes)
 
 # -----------------------------------------------------------------------------
 # --- clear
 # -----------------------------------------------------------------------------
 
-proc clear*(buf: var EncodedPacketBuffer) =
+proc clear*(buf: EncodedPacketBuffer) =
   buf.packets.clear()
   buf.totalBytes = 0
   buf.h264ParameterSetPrefix = @[]
@@ -355,7 +366,7 @@ proc hasH264ParameterSetPrefix*(buf: EncodedPacketBuffer): bool =
 # --- popOldest
 # -----------------------------------------------------------------------------
 
-proc popOldest(buf: var EncodedPacketBuffer) =
+proc popOldest(buf: EncodedPacketBuffer) =
   let old = buf.packets.popFirst()
   buf.totalBytes -= old.data.len
   if buf.totalBytes < 0:
@@ -376,7 +387,7 @@ proc hasKeyframe*(buf: EncodedPacketBuffer): bool =
 # --- trimLeadingNonKeyframes
 # -----------------------------------------------------------------------------
 
-proc trimLeadingNonKeyframes*(buf: var EncodedPacketBuffer) =
+proc trimLeadingNonKeyframes*(buf: EncodedPacketBuffer) =
   ## Drop leading non-keyframes once a keyframe exists in the retained window.
   ##
   ## If no keyframe is present yet, keep the packets for diagnostics and for
@@ -392,7 +403,7 @@ proc trimLeadingNonKeyframes*(buf: var EncodedPacketBuffer) =
 # --- trim
 # -----------------------------------------------------------------------------
 
-proc trim*(buf: var EncodedPacketBuffer; nowUsec: int64) =
+proc trim*(buf: EncodedPacketBuffer; nowUsec: int64) =
   ## Apply time/byte limits and then keep the front aligned to a keyframe.
   let oldestAllowed = nowUsec - buf.maxDurationUsec
 
@@ -412,7 +423,7 @@ proc trim*(buf: var EncodedPacketBuffer; nowUsec: int64) =
 # --- push
 # -----------------------------------------------------------------------------
 
-proc push*(buf: var EncodedPacketBuffer; pkt: sink OwnedEncodedPacket) =
+proc push*(buf: EncodedPacketBuffer; pkt: sink OwnedEncodedPacket) =
   ## Add one packet and trim using the packet timestamp as the current time.
   let nowUsec = pkt.timestampUsec
   if buf.h264ParameterSetPrefix.len == 0:
