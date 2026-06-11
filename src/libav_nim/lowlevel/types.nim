@@ -401,6 +401,7 @@ type
     pts*: int64
     dts*: int64
     duration*: int64
+    isKeyframe*: bool
     timeBase*: Rational
 
 # =============================================================================
