@@ -29,6 +29,8 @@ type
     duration*: int64
     timeBase*: Rational
     isKeyframe*: bool
+    hasH264Sps*: bool
+    hasH264Pps*: bool
     timestampUsec*: int64
 
   EncodedPacketBuffer* = object
@@ -49,13 +51,13 @@ type
 # --- containsH264IdrNal
 # -----------------------------------------------------------------------------
 
-proc containsH264IdrNal*(data: openArray[byte]): bool =
-  ## Return true when data appears to contain an H.264 IDR NAL unit.
+proc containsH264NalType*(data: openArray[byte]; targetNalType: int): bool =
+  ## Return true when data appears to contain the requested H.264 NAL type.
   ##
-  ## Some hardware encoders do not reliably propagate AV_PKT_FLAG_KEY on the
-  ## packet wrapper. Event recording still needs a keyframe marker, so this
-  ## provides a conservative H.264 payload fallback for both Annex B start-code
-  ## packets and 4-byte length-prefixed packets.
+  ## This supports both Annex B start-code packets and AVCC-style 4-byte
+  ## length-prefixed packets. MP4 event clips should preferably start from a
+  ## keyframe packet that also carries SPS/PPS, because some hardware encoders do
+  ## not provide enough extradata for a mid-stream clip to decode otherwise.
 
   # Annex B: 00 00 01 xx or 00 00 00 01 xx
   var i = 0
@@ -69,7 +71,7 @@ proc containsH264IdrNal*(data: openArray[byte]): bool =
 
       if nalIndex >= 0 and nalIndex < data.len:
         let nalType = int(data[nalIndex]) and 0x1f
-        if nalType == 5:
+        if nalType == targetNalType:
           return true
         i = nalIndex + 1
         continue
@@ -89,12 +91,29 @@ proc containsH264IdrNal*(data: openArray[byte]): bool =
       break
 
     let nalType = int(data[pos + 4]) and 0x1f
-    if nalType == 5:
+    if nalType == targetNalType:
       return true
 
     pos += 4 + nalLen
 
   result = false
+
+# -----------------------------------------------------------------------------
+# --- containsH264IdrNal
+# -----------------------------------------------------------------------------
+
+proc containsH264IdrNal*(data: openArray[byte]): bool =
+  ## Return true when data appears to contain an H.264 IDR NAL unit.
+  result = data.containsH264NalType(5)
+
+# -----------------------------------------------------------------------------
+# --- containsH264SpsPps
+# -----------------------------------------------------------------------------
+
+proc containsH264SpsPps*(data: openArray[byte]): tuple[hasSps: bool, hasPps: bool] =
+  ## Return whether data appears to contain H.264 SPS/PPS NAL units.
+  result.hasSps = data.containsH264NalType(7)
+  result.hasPps = data.containsH264NalType(8)
 
 # -----------------------------------------------------------------------------
 # --- copyEncodedPacket
@@ -119,6 +138,10 @@ proc copyEncodedPacket*(view: EncodedPacketView; timestampUsec: int64): OwnedEnc
     if view.data.isNil:
       raise newException(ValueError, "Encoded packet has nil data")
     copyMem(result.data[0].addr, view.data, view.size)
+
+  let h264ParamSets = result.data.containsH264SpsPps()
+  result.hasH264Sps = h264ParamSets.hasSps
+  result.hasH264Pps = h264ParamSets.hasPps
 
   if not result.isKeyframe and result.data.containsH264IdrNal():
     result.isKeyframe = true
@@ -203,6 +226,16 @@ proc keyframeCount*(buf: EncodedPacketBuffer): int =
     if pkt.isKeyframe:
       inc result
 
+# -----------------------------------------------------------------------------
+# --- h264ParameterSetPacketCount
+# -----------------------------------------------------------------------------
+
+proc h264ParameterSetPacketCount*(buf: EncodedPacketBuffer): int =
+  result = 0
+  for pkt in buf.packets:
+    if pkt.hasH264Sps and pkt.hasH264Pps:
+      inc result
+
 # =============================================================================
 # === Trimming
 # =============================================================================
@@ -284,21 +317,34 @@ proc push*(buf: var EncodedPacketBuffer; pkt: sink OwnedEncodedPacket) =
 # -----------------------------------------------------------------------------
 
 proc findStartKeyframeIndex*(buf: EncodedPacketBuffer; desiredStartUsec: int64): int =
-  ## Find the last keyframe at or before desiredStartUsec.
+  ## Find a safe event clip start at or before desiredStartUsec.
+  ##
+  ## Prefer the last keyframe that also carries H.264 SPS/PPS at or before the
+  ## requested start. Starting a new MP4 clip from a later IDR-only packet can be
+  ## invalid with some hardware encoders because the mid-stream clip has no
+  ## decoder configuration. If no such self-contained keyframe exists, fall back
+  ## to the last keyframe, then to packet 0.
   ##
   ## Returns 0 when the buffer has packets but no earlier keyframe was found.
   ## Returns -1 when the buffer is empty.
   if buf.packets.len == 0:
     return -1
 
-  result = -1
+  var fallbackKeyframe = -1
+  var selfContainedKeyframe = -1
   var i = 0
   for pkt in buf.packets:
     if pkt.timestampUsec <= desiredStartUsec and pkt.isKeyframe:
-      result = i
+      fallbackKeyframe = i
+      if pkt.hasH264Sps and pkt.hasH264Pps:
+        selfContainedKeyframe = i
     inc i
 
-  if result < 0:
+  if selfContainedKeyframe >= 0:
+    result = selfContainedKeyframe
+  elif fallbackKeyframe >= 0:
+    result = fallbackKeyframe
+  else:
     result = 0
 
 # -----------------------------------------------------------------------------
@@ -322,6 +368,39 @@ proc packetsFrom*(buf: EncodedPacketBuffer; startIndex: int): seq[OwnedEncodedPa
     inc i
 
 # -----------------------------------------------------------------------------
+# --- findEndPacketIndex
+# -----------------------------------------------------------------------------
+
+proc findEndPacketIndex*(buf: EncodedPacketBuffer; desiredEndUsec: int64): int =
+  ## Find the exclusive end index for packets at or before desiredEndUsec.
+  ##
+  ## Returns 0 when the buffer is empty. The returned value is suitable as an
+  ## exclusive end index for writeEncodedPacketBufferRange().
+  result = 0
+  var i = 0
+  for pkt in buf.packets:
+    if pkt.timestampUsec <= desiredEndUsec:
+      result = i + 1
+    inc i
+
+# -----------------------------------------------------------------------------
+# --- packetTimestampUsecAt
+# -----------------------------------------------------------------------------
+
+proc packetTimestampUsecAt*(buf: EncodedPacketBuffer; index: int): int64 =
+  ## Return packet timestamp at index, or 0 for an invalid index.
+  if index < 0 or index >= buf.packets.len:
+    return 0
+
+  var i = 0
+  for pkt in buf.packets:
+    if i == index:
+      return pkt.timestampUsec
+    inc i
+
+  result = 0
+
+# -----------------------------------------------------------------------------
 # --- iterPacketsFrom
 # -----------------------------------------------------------------------------
 
@@ -337,7 +416,7 @@ iterator iterPacketsFrom*(buf: EncodedPacketBuffer; startIndex: int): OwnedEncod
 # -----------------------------------------------------------------------------
 
 proc statsText*(buf: EncodedPacketBuffer): string =
-  result = &"packets={buf.len} bytes={buf.totalBytes} duration_us={buf.durationUsec} keyframes={buf.keyframeCount}"
+  result = &"packets={buf.len} bytes={buf.totalBytes} duration_us={buf.durationUsec} keyframes={buf.keyframeCount} h264_spspps={buf.h264ParameterSetPacketCount}"
   if buf.packets.len > 0:
     result.add(&" oldest_us={buf.oldestTimestampUsec} newest_us={buf.newestTimestampUsec}")
 # =============================================================================
@@ -389,17 +468,23 @@ proc writeOwnedEncodedPacket*(
 # --- writeEncodedPacketBuffer
 # -----------------------------------------------------------------------------
 
-proc writeEncodedPacketBuffer*(
+proc writeEncodedPacketBufferRange*(
     writer: Mp4VideoWriter;
     buf: EncodedPacketBuffer;
-    startIndex: int = 0;
+    startIndex: int;
+    endIndexExclusive: int;
     rebaseTimestamps: bool = true
   ): FFmpegResult[int] =
-  ## Write retained packets from startIndex to writer.
+  ## Write retained packets in [startIndex, endIndexExclusive) to writer.
   ##
   ## When rebaseTimestamps is true, the first written packet starts at pts/dts 0.
   ## Returns the number of packets written.
   if startIndex < 0 or startIndex >= buf.packets.len:
+    result = ok(0)
+    return
+
+  let boundedEnd = min(endIndexExclusive, buf.packets.len)
+  if boundedEnd <= startIndex:
     result = ok(0)
     return
 
@@ -409,7 +494,7 @@ proc writeEncodedPacketBuffer*(
     var found = false
     var i = 0
     for pkt in buf.packets:
-      if i >= startIndex:
+      if i == startIndex:
         ptsOffset = pkt.pts
         dtsOffset = pkt.dts
         found = true
@@ -422,7 +507,7 @@ proc writeEncodedPacketBuffer*(
   var count = 0
   var i = 0
   for pkt in buf.packets:
-    if i >= startIndex:
+    if i >= startIndex and i < boundedEnd:
       let writeRet = writer.writeOwnedEncodedPacket(pkt, ptsOffset, dtsOffset)
       if writeRet.isErr:
         result = err(writeRet.error)
@@ -431,4 +516,22 @@ proc writeEncodedPacketBuffer*(
     inc i
 
   result = ok(count)
+
+# -----------------------------------------------------------------------------
+# --- writeEncodedPacketBuffer
+# -----------------------------------------------------------------------------
+
+proc writeEncodedPacketBuffer*(
+    writer: Mp4VideoWriter;
+    buf: EncodedPacketBuffer;
+    startIndex: int = 0;
+    rebaseTimestamps: bool = true
+  ): FFmpegResult[int] =
+  ## Write retained packets from startIndex to writer.
+  result = writer.writeEncodedPacketBufferRange(
+    buf,
+    startIndex,
+    buf.packets.len,
+    rebaseTimestamps
+  )
 

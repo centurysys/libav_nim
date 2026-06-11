@@ -48,6 +48,7 @@ type
     writePacket: StageStats
     ringPush: StageStats
     ringWrite: StageStats
+    eventWrite: StageStats
     encoderFlush: StageStats
     writerFinish: StageStats
 
@@ -108,6 +109,10 @@ proc usage() =
   echo "  --ring-max-bytes=N             optional byte limit for the encoded packet ring. default: 0 disabled"
   echo "  --dump-ring-stats              print encoded packet ring statistics at the end"
   echo "  --ring-output=PATH             write retained ring packets to another MP4 after encoding"
+  echo "  --event-frame=N                create a pseudo event clip around this frame index. default: disabled"
+  echo "  --pre-seconds=N                event clip pre-roll seconds. default: 10"
+  echo "  --post-seconds=N               event clip post-roll seconds. default: 5"
+  echo "  --event-output=PATH            pseudo event MP4 output. default: event_0001.mp4"
   echo "  --help                         show this help"
   echo ""
   echo "example:"
@@ -172,7 +177,11 @@ proc validateFlags(flags: seq[string]) =
         flag.startsWith("--font=") or
         flag.startsWith("--ring-seconds=") or
         flag.startsWith("--ring-max-bytes=") or
-        flag.startsWith("--ring-output="):
+        flag.startsWith("--ring-output=") or
+        flag.startsWith("--event-frame=") or
+        flag.startsWith("--pre-seconds=") or
+        flag.startsWith("--post-seconds=") or
+        flag.startsWith("--event-output="):
       continue
 
     raise newException(IOError, &"Unknown option: {flag}")
@@ -264,6 +273,7 @@ proc printTimingSummary(timing: PipelineTiming; frameCount: int; packets: int) =
   printStage("writePacket", timing.writePacket, frameCount)
   printStage("ringPush", timing.ringPush, frameCount)
   printStage("ringWrite", timing.ringWrite, frameCount)
+  printStage("eventWrite", timing.eventWrite, frameCount)
 
 # =============================================================================
 # === Pixie zero-copy move adapter and overlay
@@ -522,6 +532,10 @@ proc main() =
   let ringMaxBytes = parseInt64Flag(flags, "--ring-max-bytes", 0'i64)
   let dumpRingStats = flags.hasFlag("--dump-ring-stats")
   let ringOutputPath = parseStringFlag(flags, "--ring-output", "")
+  let eventFrame = parseIntFlag(flags, "--event-frame", -1)
+  let preSeconds = parseIntFlag(flags, "--pre-seconds", 10)
+  let postSeconds = parseIntFlag(flags, "--post-seconds", 5)
+  let eventOutputPath = parseStringFlag(flags, "--event-output", "event_0001.mp4")
 
   if maxFrames < 0:
     failWith(&"Invalid frame count: {maxFrames}")
@@ -533,6 +547,16 @@ proc main() =
     failWith(&"Invalid ring max bytes: {ringMaxBytes}")
   if ringOutputPath.len > 0 and ringSeconds <= 0:
     failWith("--ring-output requires --ring-seconds=N greater than 0")
+  if eventFrame < -1:
+    failWith(&"Invalid event frame: {eventFrame}")
+  if preSeconds < 0:
+    failWith(&"Invalid pre seconds: {preSeconds}")
+  if postSeconds < 0:
+    failWith(&"Invalid post seconds: {postSeconds}")
+  if eventFrame >= 0 and ringSeconds <= 0:
+    failWith("--event-frame requires --ring-seconds=N greater than 0")
+  if eventFrame >= 0 and maxFrames > 0 and eventFrame >= maxFrames:
+    failWith(&"--event-frame={eventFrame} is outside --frames={maxFrames}")
 
   var inputOptions: seq[DecoderInputOption]
   if flags.hasFlag("--rtsp-low-latency"):
@@ -582,6 +606,8 @@ proc main() =
     logStep(&"encoded packet ring enabled: seconds={ringSeconds} maxBytes={ringMaxBytes}")
   if ringOutputPath.len > 0:
     logStep(&"ring MP4 output enabled: {ringOutputPath}")
+  if eventFrame >= 0:
+    logStep(&"pseudo event enabled: frame={eventFrame} pre={preSeconds}s post={postSeconds}s output={eventOutputPath}")
   for item in inputOptions:
     logStep(&"input option: {item.key}={item.value}")
 
@@ -708,6 +734,43 @@ proc main() =
     finally:
       ringWriter.close()
 
+  var eventWrittenPackets = 0
+  var eventStartIndex = -1
+  var eventEndIndex = 0
+  var eventStartUsec = 0'i64
+  var eventEndUsec = 0'i64
+  var eventActualStartUsec = 0'i64
+  if eventFrame >= 0:
+    if packetBuffer.len == 0:
+      failWith("Cannot write event output: encoded packet ring is empty")
+
+    let eventUsec = fps.timestampUsecForFrame(int64(eventFrame))
+    eventStartUsec = eventUsec - int64(preSeconds) * 1_000_000'i64
+    if eventStartUsec < 0:
+      eventStartUsec = 0
+    eventEndUsec = eventUsec + int64(postSeconds) * 1_000_000'i64
+
+    eventStartIndex = packetBuffer.findStartKeyframeIndex(eventStartUsec)
+    eventEndIndex = packetBuffer.findEndPacketIndex(eventEndUsec)
+    if eventStartIndex < 0 or eventEndIndex <= eventStartIndex:
+      failWith(&"Cannot write event output: no packets for event window start_us={eventStartUsec} end_us={eventEndUsec}")
+
+    eventActualStartUsec = packetBuffer.packetTimestampUsecAt(eventStartIndex)
+    logStep(&"opening event MP4 writer: {eventOutputPath} startIndex={eventStartIndex} endIndex={eventEndIndex} requested={eventStartUsec}..{eventEndUsec} actualStart={eventActualStartUsec}")
+    var eventWriter = check(openMp4VideoWriter(eventOutputPath, encoder))
+    try:
+      timeVoid(timing.eventWrite):
+        eventWrittenPackets = check(eventWriter.writeEncodedPacketBufferRange(
+          packetBuffer,
+          eventStartIndex,
+          eventEndIndex,
+          rebaseTimestamps = true
+        ))
+      logStep(&"finishing event MP4 writer: packets={eventWrittenPackets}")
+      checkVoid(eventWriter.finish())
+    finally:
+      eventWriter.close()
+
   let totalMs = nowMs() - totalStartedAt
   let effectiveFps = if totalMs > 0.0: float(decodedFrames) * 1000.0 / totalMs else: 0.0
   let transportName = if rtspTransportTcp: "rtsp-tcp" else: "default"
@@ -735,6 +798,14 @@ proc main() =
   if ringOutputPath.len > 0:
     echo &"  ring output  : {ringOutputPath}"
     echo &"  ring written : {ringOutputPackets}"
+  if eventFrame >= 0:
+    echo &"  event frame  : {eventFrame}"
+    echo &"  event pre    : {preSeconds}"
+    echo &"  event post   : {postSeconds}"
+    echo &"  event request: {eventStartUsec}..{eventEndUsec}"
+    echo &"  event actual : start_us={eventActualStartUsec} start_index={eventStartIndex} end_index={eventEndIndex}"
+    echo &"  event output : {eventOutputPath}"
+    echo &"  event written: {eventWrittenPackets}"
   echo &"  i420 bytes   : {ownedI420.byteSize()}"
   echo &"  rgbx bytes   : {rgbx.byteSize()}"
   echo &"  total ms     : {totalMs.formatMs()}"
