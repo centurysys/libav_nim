@@ -5,7 +5,7 @@
 import libav_nim
 
 proc main() =
-  var recorder = initEventRecorder(preSeconds = 3, postSeconds = 2, outputPattern = "event_$1.mp4")
+  var recorder = initEventRecorder(preSeconds = 3, postSeconds = 2, maxClipSeconds = 8, outputPattern = "event_$1.mp4")
 
   doAssert recorder.state == ersIdle
   doAssert not recorder.hasPendingEvent()
@@ -17,6 +17,8 @@ proc main() =
   doAssert first.eventUsec == 5_000_000'i64
   doAssert first.firstEventUsec == 5_000_000'i64
   doAssert first.recordUntilUsec == 7_000_000'i64
+  doAssert first.maxRecordUntilUsec == 10_000_000'i64
+  doAssert not first.clipped
   doAssert first.outputPath == "event_0001.mp4"
   doAssert recorder.state == ersPending
   doAssert recorder.hasPendingEvent()
@@ -31,6 +33,8 @@ proc main() =
   doAssert second.eventUsec == 6_500_000'i64
   doAssert second.firstEventUsec == 5_000_000'i64
   doAssert second.recordUntilUsec == 8_500_000'i64
+  doAssert second.maxRecordUntilUsec == 10_000_000'i64
+  doAssert not second.clipped
   doAssert second.outputPath == "event_0001.mp4"
   doAssert recorder.pendingEventUsec == 5_000_000'i64
   doAssert recorder.pendingRecordUntilUsec == 8_500_000'i64
@@ -41,6 +45,22 @@ proc main() =
   doAssert not third.started
   doAssert not third.extended
   doAssert third.recordUntilUsec == 8_500_000'i64
+  doAssert not third.clipped
+
+  let clipped = recorder.trigger(9_000_000'i64)
+  doAssert not clipped.started
+  doAssert clipped.extended
+  doAssert clipped.clipped
+  doAssert clipped.recordUntilUsec == 10_000_000'i64
+  doAssert recorder.pendingRecordUntilUsec == 10_000_000'i64
+  doAssert not recorder.readyToFinalize(9_999_999'i64)
+  doAssert recorder.readyToFinalize(10_000_000'i64)
+
+  let beyondLimit = recorder.trigger(12_000_000'i64)
+  doAssert not beyondLimit.started
+  doAssert not beyondLimit.extended
+  doAssert beyondLimit.clipped
+  doAssert beyondLimit.recordUntilUsec == 10_000_000'i64
 
   recorder.clearPending()
   doAssert recorder.state == ersIdle

@@ -35,6 +35,7 @@ type
     ## inserted before the extension.
     preUsec*: int64
     postUsec*: int64
+    maxClipUsec*: int64
     outputPattern*: string
 
   EventClipResult* = object
@@ -58,6 +59,8 @@ type
     eventUsec*: int64
     firstEventUsec*: int64
     recordUntilUsec*: int64
+    maxRecordUntilUsec*: int64
+    clipped*: bool
     outputPath*: string
 
   EventRecorder* = object
@@ -75,34 +78,52 @@ type
 proc initEventRecorderOptions*(
     preSeconds: int = 10;
     postSeconds: int = 5;
-    outputPattern: string = "event_$1.mp4"
+    outputPattern: string = "event_$1.mp4";
+    maxClipSeconds: int = 60
   ): EventRecorderOptions =
   ## Create options from second-based pre/post durations.
   if preSeconds < 0:
     raise newException(ValueError, &"Invalid preSeconds: {preSeconds}")
   if postSeconds < 0:
     raise newException(ValueError, &"Invalid postSeconds: {postSeconds}")
+  if maxClipSeconds < 0:
+    raise newException(ValueError, &"Invalid maxClipSeconds: {maxClipSeconds}")
+  if maxClipSeconds > 0 and maxClipSeconds < preSeconds + postSeconds:
+    raise newException(
+      ValueError,
+      &"Invalid maxClipSeconds: {maxClipSeconds}; must be 0 or >= preSeconds + postSeconds"
+    )
 
   result = EventRecorderOptions(
     preUsec: int64(preSeconds) * 1_000_000'i64,
     postUsec: int64(postSeconds) * 1_000_000'i64,
+    maxClipUsec: int64(maxClipSeconds) * 1_000_000'i64,
     outputPattern: outputPattern
   )
 
 proc initEventRecorderOptionsUsec*(
     preUsec: int64;
     postUsec: int64;
-    outputPattern: string = "event_$1.mp4"
+    outputPattern: string = "event_$1.mp4";
+    maxClipUsec: int64 = 60_000_000'i64
   ): EventRecorderOptions =
   ## Create options from microsecond-based pre/post durations.
   if preUsec < 0:
     raise newException(ValueError, &"Invalid preUsec: {preUsec}")
   if postUsec < 0:
     raise newException(ValueError, &"Invalid postUsec: {postUsec}")
+  if maxClipUsec < 0:
+    raise newException(ValueError, &"Invalid maxClipUsec: {maxClipUsec}")
+  if maxClipUsec > 0 and maxClipUsec < preUsec + postUsec:
+    raise newException(
+      ValueError,
+      &"Invalid maxClipUsec: {maxClipUsec}; must be 0 or >= preUsec + postUsec"
+    )
 
   result = EventRecorderOptions(
     preUsec: preUsec,
     postUsec: postUsec,
+    maxClipUsec: maxClipUsec,
     outputPattern: outputPattern
   )
 
@@ -117,9 +138,10 @@ proc initEventRecorder*(options: EventRecorderOptions): EventRecorder =
 proc initEventRecorder*(
     preSeconds: int = 10;
     postSeconds: int = 5;
-    outputPattern: string = "event_$1.mp4"
+    outputPattern: string = "event_$1.mp4";
+    maxClipSeconds: int = 60
   ): EventRecorder =
-  result = initEventRecorder(initEventRecorderOptions(preSeconds, postSeconds, outputPattern))
+  result = initEventRecorder(initEventRecorderOptions(preSeconds, postSeconds, outputPattern, maxClipSeconds))
 
 # =============================================================================
 # === Output path helpers
@@ -240,6 +262,20 @@ proc clearPending*(recorder: var EventRecorder) =
 proc hasPendingEvent*(recorder: EventRecorder): bool =
   result = recorder.state == ersPending
 
+proc clipStartUsecFor*(recorder: EventRecorder; eventUsec: int64): int64 =
+  ## Return the requested clip start timestamp for eventUsec, clamped to zero.
+  result = eventUsec - recorder.options.preUsec
+  if result < 0:
+    result = 0
+
+proc maxRecordUntilUsecFor*(recorder: EventRecorder; firstEventUsec: int64): int64 =
+  ## Return the maximum allowed end timestamp for the clip anchored at firstEventUsec.
+  ## A maxClipUsec of 0 means unlimited.
+  let startUsec = recorder.clipStartUsecFor(firstEventUsec)
+  if recorder.options.maxClipUsec <= 0:
+    return high(int64)
+  result = startUsec + recorder.options.maxClipUsec
+
 proc trigger*(
     recorder: var EventRecorder;
     eventUsec: int64;
@@ -250,12 +286,13 @@ proc trigger*(
   ## If idle, the first event anchors the pre-roll and output path.  If another
   ## trigger arrives before finalization, the clip end is extended to
   ## eventUsec + postUsec while preserving the first event timestamp.
-  let untilUsec = eventUsec + recorder.options.postUsec
+  let desiredUntilUsec = eventUsec + recorder.options.postUsec
 
   if recorder.state == ersIdle:
     recorder.state = ersPending
     recorder.pendingEventUsec = eventUsec
-    recorder.pendingRecordUntilUsec = untilUsec
+    let maxUntilUsec = recorder.maxRecordUntilUsecFor(recorder.pendingEventUsec)
+    recorder.pendingRecordUntilUsec = min(desiredUntilUsec, maxUntilUsec)
     recorder.pendingOutputPath = if outputPath.len > 0: outputPath else: recorder.makeEventOutputPath(recorder.nextIndex)
 
     result = EventTriggerResult(
@@ -264,12 +301,16 @@ proc trigger*(
       eventUsec: eventUsec,
       firstEventUsec: recorder.pendingEventUsec,
       recordUntilUsec: recorder.pendingRecordUntilUsec,
+      maxRecordUntilUsec: maxUntilUsec,
+      clipped: desiredUntilUsec > maxUntilUsec,
       outputPath: recorder.pendingOutputPath
     )
   else:
     let oldUntil = recorder.pendingRecordUntilUsec
-    if untilUsec > recorder.pendingRecordUntilUsec:
-      recorder.pendingRecordUntilUsec = untilUsec
+    let maxUntilUsec = recorder.maxRecordUntilUsecFor(recorder.pendingEventUsec)
+    let cappedUntilUsec = min(desiredUntilUsec, maxUntilUsec)
+    if cappedUntilUsec > recorder.pendingRecordUntilUsec:
+      recorder.pendingRecordUntilUsec = cappedUntilUsec
 
     result = EventTriggerResult(
       started: false,
@@ -277,6 +318,8 @@ proc trigger*(
       eventUsec: eventUsec,
       firstEventUsec: recorder.pendingEventUsec,
       recordUntilUsec: recorder.pendingRecordUntilUsec,
+      maxRecordUntilUsec: maxUntilUsec,
+      clipped: desiredUntilUsec > maxUntilUsec,
       outputPath: recorder.pendingOutputPath
     )
 

@@ -113,6 +113,7 @@ proc usage() =
   echo "  --event-frames=A,B,C           trigger multiple realtime pseudo events at frame indexes"
   echo "  --pre-seconds=N                event clip pre-roll seconds. default: 10"
   echo "  --post-seconds=N               event clip post-roll seconds. default: 5"
+  echo "  --max-clip-seconds=N           maximum event clip duration. default: 60. 0 means unlimited"
   echo "  --event-output=PATH            single-event MP4 output. default: event_0001.mp4"
   echo "  --event-output-pattern=PATTERN multi-event output pattern. default: event_$1.mp4"
   echo "  --help                         show this help"
@@ -184,6 +185,7 @@ proc validateFlags(flags: seq[string]) =
         flag.startsWith("--event-frames=") or
         flag.startsWith("--pre-seconds=") or
         flag.startsWith("--post-seconds=") or
+        flag.startsWith("--max-clip-seconds=") or
         flag.startsWith("--event-output=") or
         flag.startsWith("--event-output-pattern="):
       continue
@@ -570,6 +572,7 @@ proc main() =
   let hasPseudoEvents = eventFrames.len > 0
   let preSeconds = parseIntFlag(flags, "--pre-seconds", 10)
   let postSeconds = parseIntFlag(flags, "--post-seconds", 5)
+  let maxClipSeconds = parseIntFlag(flags, "--max-clip-seconds", 60)
   let eventOutputPath = parseStringFlag(flags, "--event-output", "event_0001.mp4")
   let eventOutputPattern = parseStringFlag(flags, "--event-output-pattern", "event_$1.mp4")
 
@@ -590,6 +593,10 @@ proc main() =
     failWith(&"Invalid pre seconds: {preSeconds}")
   if postSeconds < 0:
     failWith(&"Invalid post seconds: {postSeconds}")
+  if maxClipSeconds < 0:
+    failWith(&"Invalid max clip seconds: {maxClipSeconds}")
+  if maxClipSeconds > 0 and maxClipSeconds < preSeconds + postSeconds:
+    failWith(&"Invalid max clip seconds: {maxClipSeconds}; must be 0 or >= pre + post")
   if hasPseudoEvents and ringSeconds <= 0:
     failWith("--event-frame/--event-frames requires --ring-seconds=N greater than 0")
   if maxFrames > 0:
@@ -647,9 +654,9 @@ proc main() =
     logStep(&"ring MP4 output enabled: {ringOutputPath}")
   if hasPseudoEvents:
     if eventFrames.len == 1:
-      logStep(&"realtime pseudo event enabled: frame={eventFrames[0]} pre={preSeconds}s post={postSeconds}s output={eventOutputPath}")
+      logStep(&"realtime pseudo event enabled: frame={eventFrames[0]} pre={preSeconds}s post={postSeconds}s maxClip={maxClipSeconds}s output={eventOutputPath}")
     else:
-      logStep(&"realtime pseudo events enabled: frames={eventFrames.eventFramesText()} pre={preSeconds}s post={postSeconds}s outputPattern={eventOutputPattern}")
+      logStep(&"realtime pseudo events enabled: frames={eventFrames.eventFramesText()} pre={preSeconds}s post={postSeconds}s maxClip={maxClipSeconds}s outputPattern={eventOutputPattern}")
   for item in inputOptions:
     logStep(&"input option: {item.key}={item.value}")
 
@@ -730,7 +737,7 @@ proc main() =
   var packetBuffer = initEncodedPacketBuffer(int64(ringSeconds) * 1_000_000'i64, ringMaxBytes)
 
   let recorderOutputPattern = if eventFrames.len > 1: eventOutputPattern else: eventOutputPath
-  var eventRecorder = initEventRecorder(preSeconds, postSeconds, recorderOutputPattern)
+  var eventRecorder = initEventRecorder(preSeconds, postSeconds, recorderOutputPattern, maxClipSeconds)
   var eventClips: seq[EventClipResult]
   var eventNextFrameIndex = 0
   var eventTriggerCount = 0
@@ -746,7 +753,7 @@ proc main() =
     eventTriggerInfo = eventRecorder.trigger(firstFrameUsec, explicitOutput)
     inc eventTriggerCount
     let action = if eventTriggerInfo.started: "started" elif eventTriggerInfo.extended: "extended" else: "kept"
-    logStep(&"realtime event {action}: frame={eventFrames[eventNextFrameIndex]} eventUsec={firstFrameUsec} firstEvent={eventTriggerInfo.firstEventUsec} recordUntil={eventTriggerInfo.recordUntilUsec} output={eventTriggerInfo.outputPath}")
+    logStep(&"realtime event {action}: frame={eventFrames[eventNextFrameIndex]} eventUsec={firstFrameUsec} firstEvent={eventTriggerInfo.firstEventUsec} recordUntil={eventTriggerInfo.recordUntilUsec} maxUntil={eventTriggerInfo.maxRecordUntilUsec} clipped={eventTriggerInfo.clipped} output={eventTriggerInfo.outputPath}")
     inc eventNextFrameIndex
 
   if eventRecorder.readyToFinalize(packetBuffer):
@@ -789,7 +796,7 @@ proc main() =
       eventTriggerInfo = eventRecorder.trigger(frameUsec, explicitOutput)
       inc eventTriggerCount
       let action = if eventTriggerInfo.started: "started" elif eventTriggerInfo.extended: "extended" else: "kept"
-      logStep(&"realtime event {action}: frame={eventFrames[eventNextFrameIndex]} eventUsec={frameUsec} firstEvent={eventTriggerInfo.firstEventUsec} recordUntil={eventTriggerInfo.recordUntilUsec} output={eventTriggerInfo.outputPath}")
+      logStep(&"realtime event {action}: frame={eventFrames[eventNextFrameIndex]} eventUsec={frameUsec} firstEvent={eventTriggerInfo.firstEventUsec} recordUntil={eventTriggerInfo.recordUntilUsec} maxUntil={eventTriggerInfo.maxRecordUntilUsec} clipped={eventTriggerInfo.clipped} output={eventTriggerInfo.outputPath}")
       inc eventNextFrameIndex
 
     if eventRecorder.readyToFinalize(packetBuffer):
@@ -890,6 +897,7 @@ proc main() =
   if hasPseudoEvents and eventClips.len > 0:
     echo &"  event pre    : {preSeconds}"
     echo &"  event post   : {postSeconds}"
+    echo &"  event max    : {maxClipSeconds}"
     for i, clip in eventClips:
       echo &"  event[{i}] request: {clip.requestedStartUsec}..{clip.requestedEndUsec}"
       echo &"  event[{i}] actual : start_us={clip.actualStartUsec} start_index={clip.startIndex} end_index={clip.endIndexExclusive}"
