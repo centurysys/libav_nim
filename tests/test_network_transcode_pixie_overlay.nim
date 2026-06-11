@@ -737,50 +737,19 @@ proc main() =
     finally:
       ringWriter.close()
 
-  var eventWrittenPackets = 0
-  var eventStartIndex = -1
-  var eventEndIndex = 0
-  var eventStartUsec = 0'i64
-  var eventEndUsec = 0'i64
-  var eventActualStartUsec = 0'i64
+  var eventClip: EventClipResult
+  var eventHasClip = false
   if eventFrame >= 0:
-    if packetBuffer.len == 0:
-      failWith("Cannot write event output: encoded packet ring is empty")
-
     let eventUsec = fps.timestampUsecForFrame(int64(eventFrame))
-    eventStartUsec = eventUsec - int64(preSeconds) * 1_000_000'i64
-    if eventStartUsec < 0:
-      eventStartUsec = 0
-    eventEndUsec = eventUsec + int64(postSeconds) * 1_000_000'i64
+    var recorder = initEventRecorder(preSeconds, postSeconds, eventOutputPath)
 
-    let eventWriterHasExtradata = encodedStreamInfo.extradata.len > 0
-    let eventCanPrependH264ParameterSets =
-      encodedStreamInfo.extradata.len == 0 and packetBuffer.hasH264ParameterSetPrefix()
-    let eventHasDecoderHeader = eventWriterHasExtradata or eventCanPrependH264ParameterSets
-    eventStartIndex = packetBuffer.findStartKeyframeIndex(
-      eventStartUsec,
-      requireParameterSets = not eventHasDecoderHeader
-    )
-    eventEndIndex = packetBuffer.findEndPacketIndex(eventEndUsec)
-    if eventStartIndex < 0 or eventEndIndex <= eventStartIndex:
-      failWith(&"Cannot write event output: no packets for event window start_us={eventStartUsec} end_us={eventEndUsec}")
+    let planned = check(recorder.planEventClip(packetBuffer, encodedStreamInfo, eventUsec, eventOutputPath))
+    logStep(&"opening event MP4 writer: {planned.outputPath} startIndex={planned.startIndex} endIndex={planned.endIndexExclusive} requested={planned.requestedStartUsec}..{planned.requestedEndUsec} actualStart={planned.actualStartUsec} extradata={encodedStreamInfo.extradata.len} prependSpsPps={planned.prependedH264ParameterSets}")
 
-    eventActualStartUsec = packetBuffer.packetTimestampUsecAt(eventStartIndex)
-    logStep(&"opening event MP4 writer: {eventOutputPath} startIndex={eventStartIndex} endIndex={eventEndIndex} requested={eventStartUsec}..{eventEndUsec} actualStart={eventActualStartUsec} extradata={encodedStreamInfo.extradata.len} prependSpsPps={eventCanPrependH264ParameterSets}")
-    var eventWriter = check(openMp4VideoWriter(eventOutputPath, encodedStreamInfo))
-    try:
-      timeVoid(timing.eventWrite):
-        eventWrittenPackets = check(eventWriter.writeEncodedPacketBufferRange(
-          packetBuffer,
-          eventStartIndex,
-          eventEndIndex,
-          rebaseTimestamps = true,
-          prependH264ParameterSets = eventCanPrependH264ParameterSets
-        ))
-      logStep(&"finishing event MP4 writer: packets={eventWrittenPackets}")
-      checkVoid(eventWriter.finish())
-    finally:
-      eventWriter.close()
+    timeVoid(timing.eventWrite):
+      eventClip = check(recorder.writeEventClip(packetBuffer, encodedStreamInfo, eventUsec, eventOutputPath))
+    eventHasClip = true
+    logStep(&"finishing event MP4 writer: packets={eventClip.packetsWritten}")
 
   let totalMs = nowMs() - totalStartedAt
   let effectiveFps = if totalMs > 0.0: float(decodedFrames) * 1000.0 / totalMs else: 0.0
@@ -810,15 +779,15 @@ proc main() =
   if ringOutputPath.len > 0:
     echo &"  ring output  : {ringOutputPath}"
     echo &"  ring written : {ringOutputPackets}"
-  if eventFrame >= 0:
+  if eventFrame >= 0 and eventHasClip:
     echo &"  event frame  : {eventFrame}"
     echo &"  event pre    : {preSeconds}"
     echo &"  event post   : {postSeconds}"
-    echo &"  event request: {eventStartUsec}..{eventEndUsec}"
-    echo &"  event actual : start_us={eventActualStartUsec} start_index={eventStartIndex} end_index={eventEndIndex}"
-    echo &"  event header : extradata={encodedStreamInfo.extradata.len} h264_ps_prefix={packetBuffer.h264ParameterSetPrefix.len} prepend_spspps={encodedStreamInfo.extradata.len == 0 and packetBuffer.hasH264ParameterSetPrefix()} require_spspps={encodedStreamInfo.extradata.len == 0 and not packetBuffer.hasH264ParameterSetPrefix()}"
-    echo &"  event output : {eventOutputPath}"
-    echo &"  event written: {eventWrittenPackets}"
+    echo &"  event request: {eventClip.requestedStartUsec}..{eventClip.requestedEndUsec}"
+    echo &"  event actual : start_us={eventClip.actualStartUsec} start_index={eventClip.startIndex} end_index={eventClip.endIndexExclusive}"
+    echo &"  event header : extradata={encodedStreamInfo.extradata.len} h264_ps_prefix={packetBuffer.h264ParameterSetPrefix.len} prepend_spspps={eventClip.prependedH264ParameterSets} require_spspps={eventClip.requiredParameterSets}"
+    echo &"  event output : {eventClip.outputPath}"
+    echo &"  event written: {eventClip.packetsWritten}"
   echo &"  i420 bytes   : {ownedI420.byteSize()}"
   echo &"  rgbx bytes   : {rgbx.byteSize()}"
   echo &"  total ms     : {totalMs.formatMs()}"

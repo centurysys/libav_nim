@@ -1,7 +1,9 @@
 import highlevel/video_rate
 import highlevel/input_options
 import highlevel/encoded_packet_buffer
+import highlevel/event_recorder
 
 export video_rate
 export input_options
 export encoded_packet_buffer
+export event_recorder
