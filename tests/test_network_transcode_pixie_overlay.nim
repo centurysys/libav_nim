@@ -109,10 +109,10 @@ proc usage() =
   echo "  --ring-max-bytes=N             optional byte limit for the encoded packet ring. default: 0 disabled"
   echo "  --dump-ring-stats              print encoded packet ring statistics at the end"
   echo "  --ring-output=PATH             write retained ring packets to another MP4 after encoding"
-  echo "  --event-frame=N                create a pseudo event clip around this frame index. default: disabled"
+  echo "  --event-frame=N                trigger a realtime pseudo event at this frame index. default: disabled"
   echo "  --pre-seconds=N                event clip pre-roll seconds. default: 10"
   echo "  --post-seconds=N               event clip post-roll seconds. default: 5"
-  echo "  --event-output=PATH            pseudo event MP4 output. default: event_0001.mp4"
+  echo "  --event-output=PATH            realtime pseudo event MP4 output. default: event_0001.mp4"
   echo "  --help                         show this help"
   echo ""
   echo "example:"
@@ -607,7 +607,7 @@ proc main() =
   if ringOutputPath.len > 0:
     logStep(&"ring MP4 output enabled: {ringOutputPath}")
   if eventFrame >= 0:
-    logStep(&"pseudo event enabled: frame={eventFrame} pre={preSeconds}s post={postSeconds}s output={eventOutputPath}")
+    logStep(&"realtime pseudo event enabled: frame={eventFrame} pre={preSeconds}s post={postSeconds}s output={eventOutputPath}")
   for item in inputOptions:
     logStep(&"input option: {item.key}={item.value}")
 
@@ -687,10 +687,36 @@ proc main() =
   let enablePacketRing = ringSeconds > 0
   var packetBuffer = initEncodedPacketBuffer(int64(ringSeconds) * 1_000_000'i64, ringMaxBytes)
 
+  var eventRecorder = initEventRecorder(preSeconds, postSeconds, eventOutputPath)
+  var eventClip: EventClipResult
+  var eventHasClip = false
+  var eventTriggered = false
+  var eventTriggerInfo: EventTriggerResult
+
   logStep("drawing and encoding first frame")
   timeVoid(timing.pixieOverlay):
     drawPixieOverlay(rgbx, decodedFrames, maxFrames, fps, font, drawText)
   encodeRgbxFrameNv12Timed(encoder, writer, rgbx, int64(decodedFrames), timing, packets, packetBytes, packetBuffer, enablePacketRing, fps)
+  let firstFrameUsec = fps.timestampUsecForFrame(int64(decodedFrames))
+  if eventFrame >= 0 and not eventTriggered and int64(decodedFrames) >= int64(eventFrame):
+    eventTriggerInfo = eventRecorder.trigger(firstFrameUsec, eventOutputPath)
+    eventTriggered = true
+    logStep(&"realtime event triggered: eventUsec={firstFrameUsec} recordUntil={eventTriggerInfo.recordUntilUsec} output={eventTriggerInfo.outputPath}")
+
+  if eventRecorder.readyToFinalize(packetBuffer) and not eventHasClip:
+    let planned = check(eventRecorder.planEventWindowClip(
+      packetBuffer,
+      encodedStreamInfo,
+      eventRecorder.pendingEventUsec,
+      eventRecorder.pendingRecordUntilUsec,
+      eventRecorder.pendingOutputPath
+    ))
+    logStep(&"opening event MP4 writer: {planned.outputPath} startIndex={planned.startIndex} endIndex={planned.endIndexExclusive} requested={planned.requestedStartUsec}..{planned.requestedEndUsec} actualStart={planned.actualStartUsec} extradata={encodedStreamInfo.extradata.len} prependSpsPps={planned.prependedH264ParameterSets}")
+
+    timeVoid(timing.eventWrite):
+      eventClip = check(eventRecorder.writePendingClip(packetBuffer, encodedStreamInfo))
+    eventHasClip = true
+    logStep(&"finishing event MP4 writer: packets={eventClip.packetsWritten}")
   inc decodedFrames
 
   var eof = false
@@ -710,12 +736,51 @@ proc main() =
       drawPixieOverlay(rgbx, decodedFrames, maxFrames, fps, font, drawText)
 
     encodeRgbxFrameNv12Timed(encoder, writer, rgbx, int64(decodedFrames), timing, packets, packetBytes, packetBuffer, enablePacketRing, fps)
+    let frameUsec = fps.timestampUsecForFrame(int64(decodedFrames))
+    if eventFrame >= 0 and not eventTriggered and int64(decodedFrames) >= int64(eventFrame):
+      eventTriggerInfo = eventRecorder.trigger(frameUsec, eventOutputPath)
+      eventTriggered = true
+      logStep(&"realtime event triggered: eventUsec={frameUsec} recordUntil={eventTriggerInfo.recordUntilUsec} output={eventTriggerInfo.outputPath}")
+
+    if eventRecorder.readyToFinalize(packetBuffer) and not eventHasClip:
+      let planned = check(eventRecorder.planEventWindowClip(
+        packetBuffer,
+        encodedStreamInfo,
+        eventRecorder.pendingEventUsec,
+        eventRecorder.pendingRecordUntilUsec,
+        eventRecorder.pendingOutputPath
+      ))
+      logStep(&"opening event MP4 writer: {planned.outputPath} startIndex={planned.startIndex} endIndex={planned.endIndexExclusive} requested={planned.requestedStartUsec}..{planned.requestedEndUsec} actualStart={planned.actualStartUsec} extradata={encodedStreamInfo.extradata.len} prependSpsPps={planned.prependedH264ParameterSets}")
+
+      timeVoid(timing.eventWrite):
+        eventClip = check(eventRecorder.writePendingClip(packetBuffer, encodedStreamInfo))
+      eventHasClip = true
+      logStep(&"finishing event MP4 writer: packets={eventClip.packetsWritten}")
     inc decodedFrames
 
   logStep("flushing encoder")
   timeVoid(timing.encoderFlush):
     checkVoid(encoder.flush())
   drainEncoderTimed(encoder, writer, timing, packets, packetBytes, packetBuffer, enablePacketRing, fps)
+
+  if eventRecorder.hasPendingEvent() and not eventHasClip:
+    let nowUsec = if packetBuffer.len > 0: packetBuffer.newestTimestampUsec() else: fps.timestampUsecForFrame(int64(max(decodedFrames - 1, 0)))
+    if eventRecorder.readyToFinalize(packetBuffer):
+      let planned = check(eventRecorder.planEventWindowClip(
+        packetBuffer,
+        encodedStreamInfo,
+        eventRecorder.pendingEventUsec,
+        eventRecorder.pendingRecordUntilUsec,
+        eventRecorder.pendingOutputPath
+      ))
+      logStep(&"opening event MP4 writer after flush: {planned.outputPath} startIndex={planned.startIndex} endIndex={planned.endIndexExclusive} requested={planned.requestedStartUsec}..{planned.requestedEndUsec} actualStart={planned.actualStartUsec} extradata={encodedStreamInfo.extradata.len} prependSpsPps={planned.prependedH264ParameterSets}")
+
+      timeVoid(timing.eventWrite):
+        eventClip = check(eventRecorder.writePendingClip(packetBuffer, encodedStreamInfo))
+      eventHasClip = true
+      logStep(&"finishing event MP4 writer: packets={eventClip.packetsWritten}")
+    else:
+      logStep(&"pending event was not finalized: newestUsec={nowUsec} recordUntil={eventRecorder.pendingRecordUntilUsec}")
 
   logStep("finishing MP4 writer")
   timeVoid(timing.writerFinish):
@@ -736,20 +801,6 @@ proc main() =
       checkVoid(ringWriter.finish())
     finally:
       ringWriter.close()
-
-  var eventClip: EventClipResult
-  var eventHasClip = false
-  if eventFrame >= 0:
-    let eventUsec = fps.timestampUsecForFrame(int64(eventFrame))
-    var recorder = initEventRecorder(preSeconds, postSeconds, eventOutputPath)
-
-    let planned = check(recorder.planEventClip(packetBuffer, encodedStreamInfo, eventUsec, eventOutputPath))
-    logStep(&"opening event MP4 writer: {planned.outputPath} startIndex={planned.startIndex} endIndex={planned.endIndexExclusive} requested={planned.requestedStartUsec}..{planned.requestedEndUsec} actualStart={planned.actualStartUsec} extradata={encodedStreamInfo.extradata.len} prependSpsPps={planned.prependedH264ParameterSets}")
-
-    timeVoid(timing.eventWrite):
-      eventClip = check(recorder.writeEventClip(packetBuffer, encodedStreamInfo, eventUsec, eventOutputPath))
-    eventHasClip = true
-    logStep(&"finishing event MP4 writer: packets={eventClip.packetsWritten}")
 
   let totalMs = nowMs() - totalStartedAt
   let effectiveFps = if totalMs > 0.0: float(decodedFrames) * 1000.0 / totalMs else: 0.0
@@ -779,8 +830,10 @@ proc main() =
   if ringOutputPath.len > 0:
     echo &"  ring output  : {ringOutputPath}"
     echo &"  ring written : {ringOutputPackets}"
-  if eventFrame >= 0 and eventHasClip:
+  if eventFrame >= 0:
     echo &"  event frame  : {eventFrame}"
+    echo &"  event state  : {eventRecorder.state}"
+  if eventFrame >= 0 and eventHasClip:
     echo &"  event pre    : {preSeconds}"
     echo &"  event post   : {postSeconds}"
     echo &"  event request: {eventClip.requestedStartUsec}..{eventClip.requestedEndUsec}"
