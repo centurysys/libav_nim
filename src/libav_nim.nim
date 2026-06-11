@@ -7,3 +7,6 @@ export results
 
 import libav_nim/lowlevel
 export lowlevel
+
+import libav_nim/highlevel
+export highlevel

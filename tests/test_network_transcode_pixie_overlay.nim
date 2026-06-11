@@ -8,7 +8,7 @@
 # frames to match an inferred source frame rate. The output PTS/fps is supplied
 # by the caller with --fps.
 
-import std/[math, os, strformat, strutils, times]
+import std/[algorithm, os, strformat, strutils, times]
 
 import pixie
 import chroma
@@ -23,10 +23,6 @@ type
   DecoderRgbxMode = enum
     drmOwnedCopy
     drmDirect
-
-  VideoRate = object
-    num: int32
-    den: int32
 
   StageStats = object
     calls: int
@@ -50,6 +46,9 @@ type
     drainTotal: StageStats
     receivePacket: StageStats
     writePacket: StageStats
+    ringPush: StageStats
+    ringWrite: StageStats
+    eventWrite: StageStats
     encoderFlush: StageStats
     writerFinish: StageStats
 
@@ -106,6 +105,18 @@ proc usage() =
   echo "  --direct-decoder-rgbx          convert decoder I420 buffer directly into RGBX (default)"
   echo "  --font=PATH                    optional TrueType/OpenType font for Pixie text overlay"
   echo "  --no-text                      draw Pixie boxes only, even if --font is given"
+  echo "  --overlay-sweep-seconds=N      seconds for the main detection box to sweep from top-left to bottom-right. default: 8"
+  echo "  --ring-seconds=N               keep encoded packets in a time-bounded ring buffer. default: 0 disabled"
+  echo "  --ring-max-bytes=N             optional byte limit for the encoded packet ring. default: 0 disabled"
+  echo "  --dump-ring-stats              print encoded packet ring statistics at the end"
+  echo "  --ring-output=PATH             write retained ring packets to another MP4 after encoding"
+  echo "  --event-frame=N                trigger one realtime pseudo event at this frame index. default: disabled"
+  echo "  --event-frames=A,B,C           trigger multiple realtime pseudo events at frame indexes"
+  echo "  --pre-seconds=N                event clip pre-roll seconds. default: 10"
+  echo "  --post-seconds=N               event clip post-roll seconds. default: 5"
+  echo "  --max-clip-seconds=N           maximum event clip duration. default: 60. 0 means unlimited"
+  echo "  --event-output=PATH            single-event MP4 output. default: event_0001.mp4"
+  echo "  --event-output-pattern=PATTERN multi-event output pattern. default: event_$1.mp4"
   echo "  --help                         show this help"
   echo ""
   echo "example:"
@@ -140,25 +151,6 @@ proc flagValues(flags: seq[string]; prefix: string): seq[string] =
     if flag.startsWith(marker):
       result.add(flag[marker.len .. ^1])
 
-proc parseInputOption(value: string): DecoderInputOption =
-  let sep = value.find('=')
-  if sep <= 0 or sep >= value.len - 1:
-    raise newException(IOError, &"Invalid --input-option value: {value}. Expected KEY=VALUE")
-  result = (key: value[0 ..< sep], value: value[sep + 1 .. ^1])
-
-proc setInputOption(options: var seq[DecoderInputOption]; key, value: string) =
-  for item in options.mitems:
-    if item.key == key:
-      item.value = value
-      return
-  options.add((key: key, value: value))
-
-proc addRtspLowLatencyOptions(options: var seq[DecoderInputOption]) =
-  options.setInputOption("allowed_media_types", "video")
-  options.setInputOption("analyzeduration", "0")
-  options.setInputOption("probesize", "32")
-  options.setInputOption("fpsprobesize", "0")
-  options.setInputOption("fflags", "nobuffer")
 
 proc validateFlags(flags: seq[string]) =
   for flag in flags:
@@ -170,6 +162,7 @@ proc validateFlags(flags: seq[string]) =
       "--owned-decoder-copy",
       "--direct-decoder-rgbx",
       "--no-text",
+      "--dump-ring-stats",
       "--help"
     ]:
       continue
@@ -185,7 +178,18 @@ proc validateFlags(flags: seq[string]) =
         flag.startsWith("--fpsprobesize=") or
         flag.startsWith("--fflags=") or
         flag.startsWith("--input-option=") or
-        flag.startsWith("--font="):
+        flag.startsWith("--font=") or
+        flag.startsWith("--overlay-sweep-seconds=") or
+        flag.startsWith("--ring-seconds=") or
+        flag.startsWith("--ring-max-bytes=") or
+        flag.startsWith("--ring-output=") or
+        flag.startsWith("--event-frame=") or
+        flag.startsWith("--event-frames=") or
+        flag.startsWith("--pre-seconds=") or
+        flag.startsWith("--post-seconds=") or
+        flag.startsWith("--max-clip-seconds=") or
+        flag.startsWith("--event-output=") or
+        flag.startsWith("--event-output-pattern="):
       continue
 
     raise newException(IOError, &"Unknown option: {flag}")
@@ -208,44 +212,45 @@ proc parseStringFlag(flags: seq[string]; name, defaultValue: string): string =
     return defaultValue
   result = value.value
 
-proc parseVideoRate(text: string): VideoRate =
-  let slash = text.find('/')
-  if slash >= 0:
-    if slash == 0 or slash >= text.len - 1:
-      raise newException(IOError, &"Invalid fps value: {text}")
-    result = VideoRate(
-      num: int32(parseInt(text[0 ..< slash])),
-      den: int32(parseInt(text[slash + 1 .. ^1]))
-    )
-  else:
-    result = VideoRate(num: int32(parseInt(text)), den: 1)
+proc addEventFrameValue(resultFrames: var seq[int]; value: string) =
+  for part in value.split(','):
+    let item = part.strip()
+    if item.len == 0:
+      continue
+    resultFrames.add(parseInt(item))
 
-  if result.num <= 0 or result.den <= 0:
-    raise newException(IOError, &"Invalid fps value: {text}")
+proc parseEventFrames(flags: seq[string]): seq[int] =
+  let single = flags.flagValue("--event-frame")
+  if single.found:
+    result.addEventFrameValue(single.value)
+
+  for value in flags.flagValues("--event-frames"):
+    result.addEventFrameValue(value)
+
+  result.sort(system.cmp[int])
+
+  var writeIndex = 0
+  for frame in result:
+    if writeIndex == 0 or frame != result[writeIndex - 1]:
+      result[writeIndex] = frame
+      inc writeIndex
+  result.setLen(writeIndex)
+
+proc eventFramesText(frames: openArray[int]): string =
+  for i, frame in frames:
+    if i > 0:
+      result.add(",")
+    result.add($frame)
 
 proc parseVideoRateFlag(flags: seq[string]; name: string; defaultValue: VideoRate): VideoRate =
   let value = flags.flagValue(name)
   if not value.found:
     return defaultValue
-  result = parseVideoRate(value.value)
 
-proc rateText(rate: VideoRate): string =
-  if rate.den == 1:
-    result = $rate.num
-  else:
-    result = &"{rate.num}/{rate.den}"
-
-proc rateFloat(rate: VideoRate): float =
-  result = float(rate.num) / float(rate.den)
-
-proc timeBase(rate: VideoRate): Rational =
-  result = Rational(num: rate.den, den: rate.num)
-
-proc frameRate(rate: VideoRate): Rational =
-  result = Rational(num: rate.num, den: rate.den)
-
-proc gopSize(rate: VideoRate): int =
-  result = max(1, int((rate.num + rate.den - 1) div rate.den))
+  try:
+    result = parseVideoRate(value.value)
+  except ValueError as e:
+    raise newException(IOError, e.msg)
 
 proc decoderRgbxModeName(mode: DecoderRgbxMode): string =
   case mode
@@ -304,6 +309,9 @@ proc printTimingSummary(timing: PipelineTiming; frameCount: int; packets: int) =
   printStage("drainTotal", timing.drainTotal, frameCount)
   printStage("receivePacket", timing.receivePacket, frameCount)
   printStage("writePacket", timing.writePacket, frameCount)
+  printStage("ringPush", timing.ringPush, frameCount)
+  printStage("ringWrite", timing.ringWrite, frameCount)
+  printStage("eventWrite", timing.eventWrite, frameCount)
 
 # =============================================================================
 # === Pixie zero-copy move adapter and overlay
@@ -377,7 +385,8 @@ proc drawPixieOverlay(
     maxFrames: int;
     fps: VideoRate;
     font: Font;
-    drawText: bool
+    drawText: bool;
+    overlaySweepSeconds: int
   ) =
   var target = moveRgbxDataToPixieImage(frame)
 
@@ -385,16 +394,22 @@ proc drawPixieOverlay(
     let ctx = newContext(target)
     let w = float32(target.width)
     let h = float32(target.height)
-    let pulse = float32((frameIndex * 7) mod 120)
-    let movingX = 80.0'f32 + pulse
-    let movingY = 90.0'f32 + float32((frameIndex * 3) mod 60)
+    let boxW = 430.0'f32
+    let boxH = 270.0'f32
+    let marginX = 64.0'f32
+    let marginY = 124.0'f32
+    let sweepFps = max(0.1, fps.rateFloat())
+    let sweepFrames = max(2, int(round(float(max(1, overlaySweepSeconds)) * sweepFps)))
+    let sweepPhase = float32(frameIndex mod sweepFrames) / float32(sweepFrames - 1)
+    let movingX = marginX + max(0.0'f32, w - boxW - marginX * 2.0'f32) * sweepPhase
+    let movingY = marginY + max(0.0'f32, h - boxH - marginY - 80.0'f32) * sweepPhase
 
     # Semi-transparent status panel.
     ctx.fillRoundedRect(18, 18, 520, 92, 14, rgba(0, 0, 0, 120))
     ctx.fillRoundedRect(24, 24, 508, 80, 10, rgba(0, 80, 180, 70))
 
     # Detection-like boxes drawn through Pixie.
-    ctx.drawCornerBox(movingX, movingY, 430, 270, 5, rgba(0, 255, 80, 230))
+    ctx.drawCornerBox(movingX, movingY, boxW, boxH, 5, rgba(0, 255, 80, 230))
     ctx.drawBox(w - 560, h - 420, 420, 300, 4, rgba(255, 64, 64, 230))
     ctx.fillRoundedRect(w - 560, h - 454, 260, 34, 8, rgba(255, 64, 64, 150))
 
@@ -422,6 +437,15 @@ proc drawPixieOverlay(
       target.fillText(
         overlayFont.typeset("Pixie zero-copy overlay", bounds = vec2(260, 28)),
         translate(vec2(w - 548, h - 448))
+      )
+
+      overlayFont.size = 18
+      overlayFont.paint.color = color(0.85, 1, 0.9, 1)
+      let sweepPercent = formatFloat(float(sweepPhase * 100.0'f32), ffDecimal, 1)
+      let sweepText = &"Sweep {overlaySweepSeconds}s  phase={sweepPercent}%"
+      target.fillText(
+        overlayFont.typeset(sweepText, bounds = vec2(320, 28)),
+        translate(vec2(34.0'f32, 74.0'f32))
       )
   finally:
     movePixieImageDataBack(target, frame)
@@ -471,7 +495,10 @@ proc drainEncoderTimed(
     writer: Mp4VideoWriter;
     timing: var PipelineTiming;
     packets: var int;
-    packetBytes: var int64
+    packetBytes: var int64;
+    packetBuffer: EncodedPacketBuffer;
+    enablePacketRing: bool;
+    fps: VideoRate
   ) =
   timeVoid(timing.drainTotal):
     while true:
@@ -485,6 +512,11 @@ proc drainEncoderTimed(
       inc packets
       packetBytes += packetRead.packet.size
 
+      if enablePacketRing:
+        let timestampUsec = fps.timestampUsecForFrame(packetRead.packet.pts)
+        timeVoid(timing.ringPush):
+          packetBuffer.push(copyEncodedPacket(packetRead.packet, timestampUsec))
+
       timeVoid(timing.writePacket):
         checkVoid(writer.writePacket(packetRead))
 
@@ -495,7 +527,10 @@ proc encodeRgbxFrameNv12Timed(
     frameIndex: int64;
     timing: var PipelineTiming;
     packets: var int;
-    packetBytes: var int64
+    packetBytes: var int64;
+    packetBuffer: EncodedPacketBuffer;
+    enablePacketRing: bool;
+    fps: VideoRate
   ) =
   var writable: WritableNV12FrameView
   timeVoid(timing.beginFrameNV12):
@@ -507,7 +542,7 @@ proc encodeRgbxFrameNv12Timed(
   timeVoid(timing.submitFrame):
     checkVoid(encoder.submitFrame())
 
-  drainEncoderTimed(encoder, writer, timing, packets, packetBytes)
+  drainEncoderTimed(encoder, writer, timing, packets, packetBytes, packetBuffer, enablePacketRing, fps)
 
 # =============================================================================
 # === main
@@ -540,18 +575,55 @@ proc main() =
   let decoderName = parseStringFlag(flags, "--decoder", "h264_v4l2m2m")
   let encoderName = parseStringFlag(flags, "--encoder", "h264_v4l2m2m")
   let maxFrames = parseIntFlag(flags, "--frames", 300)
-  let fps = parseVideoRateFlag(flags, "--fps", VideoRate(num: 20, den: 1))
+  let fps = parseVideoRateFlag(flags, "--fps", initVideoRate(20))
   let bitrate = parseIntFlag(flags, "--bitrate", 2_000_000)
   let rtspTransportTcp = flags.hasFlag("--tcp")
   let timeoutUsec = parseInt64Flag(flags, "--timeout-usec", 0'i64)
   let decoderRgbxMode = if flags.hasFlag("--owned-decoder-copy"): drmOwnedCopy else: drmDirect
   let fontPath = parseStringFlag(flags, "--font", "")
   let drawText = not flags.hasFlag("--no-text")
+  let overlaySweepSeconds = parseIntFlag(flags, "--overlay-sweep-seconds", 8)
+  let ringSeconds = parseIntFlag(flags, "--ring-seconds", 0)
+  let ringMaxBytes = parseInt64Flag(flags, "--ring-max-bytes", 0'i64)
+  let dumpRingStats = flags.hasFlag("--dump-ring-stats")
+  let ringOutputPath = parseStringFlag(flags, "--ring-output", "")
+  let eventFrames = parseEventFrames(flags)
+  let hasPseudoEvents = eventFrames.len > 0
+  let preSeconds = parseIntFlag(flags, "--pre-seconds", 10)
+  let postSeconds = parseIntFlag(flags, "--post-seconds", 5)
+  let maxClipSeconds = parseIntFlag(flags, "--max-clip-seconds", 60)
+  let eventOutputPath = parseStringFlag(flags, "--event-output", "event_0001.mp4")
+  let eventOutputPattern = parseStringFlag(flags, "--event-output-pattern", "event_$1.mp4")
 
   if maxFrames < 0:
     failWith(&"Invalid frame count: {maxFrames}")
   if bitrate <= 0:
     failWith(&"Invalid bitrate: {bitrate}")
+  if overlaySweepSeconds <= 0:
+    failWith(&"Invalid overlay sweep seconds: {overlaySweepSeconds}")
+  if ringSeconds < 0:
+    failWith(&"Invalid ring seconds: {ringSeconds}")
+  if ringMaxBytes < 0:
+    failWith(&"Invalid ring max bytes: {ringMaxBytes}")
+  if ringOutputPath.len > 0 and ringSeconds <= 0:
+    failWith("--ring-output requires --ring-seconds=N greater than 0")
+  for frame in eventFrames:
+    if frame < 0:
+      failWith(&"Invalid event frame: {frame}")
+  if preSeconds < 0:
+    failWith(&"Invalid pre seconds: {preSeconds}")
+  if postSeconds < 0:
+    failWith(&"Invalid post seconds: {postSeconds}")
+  if maxClipSeconds < 0:
+    failWith(&"Invalid max clip seconds: {maxClipSeconds}")
+  if maxClipSeconds > 0 and maxClipSeconds < preSeconds + postSeconds:
+    failWith(&"Invalid max clip seconds: {maxClipSeconds}; must be 0 or >= pre + post")
+  if hasPseudoEvents and ringSeconds <= 0:
+    failWith("--event-frame/--event-frames requires --ring-seconds=N greater than 0")
+  if maxFrames > 0:
+    for frame in eventFrames:
+      if frame >= maxFrames:
+        failWith(&"event frame {frame} is outside --frames={maxFrames}")
 
   var inputOptions: seq[DecoderInputOption]
   if flags.hasFlag("--rtsp-low-latency"):
@@ -597,6 +669,15 @@ proc main() =
     logStep(&"using input timeout: {timeoutUsec} usec")
   if flags.hasFlag("--rtsp-low-latency"):
     logStep("using RTSP low-latency camera option preset")
+  if ringSeconds > 0:
+    logStep(&"encoded packet ring enabled: seconds={ringSeconds} maxBytes={ringMaxBytes}")
+  if ringOutputPath.len > 0:
+    logStep(&"ring MP4 output enabled: {ringOutputPath}")
+  if hasPseudoEvents:
+    if eventFrames.len == 1:
+      logStep(&"realtime pseudo event enabled: frame={eventFrames[0]} pre={preSeconds}s post={postSeconds}s maxClip={maxClipSeconds}s output={eventOutputPath}")
+    else:
+      logStep(&"realtime pseudo events enabled: frames={eventFrames.eventFramesText()} pre={preSeconds}s post={postSeconds}s maxClip={maxClipSeconds}s outputPattern={eventOutputPattern}")
   for item in inputOptions:
     logStep(&"input option: {item.key}={item.value}")
 
@@ -659,6 +740,9 @@ proc main() =
     logStep("closing encoder")
     encoder.close()
 
+  let encodedStreamInfo = check(encoder.encodedStreamInfo())
+  logStep(&"encoder stream info: codec={encodedStreamInfo.codecId} size={encodedStreamInfo.width}x{encodedStreamInfo.height} time_base={encodedStreamInfo.timeBase.num}/{encodedStreamInfo.timeBase.den} extradata={encodedStreamInfo.extradata.len} bytes")
+
   logStep(&"opening MP4 writer: {outputPath}")
   var writer: Mp4VideoWriter
   timeVoid(timing.writerOpen):
@@ -670,11 +754,44 @@ proc main() =
   var decodedFrames = 0
   var packets = 0
   var packetBytes = 0'i64
+  let enablePacketRing = ringSeconds > 0
+  let packetBuffer = newEncodedPacketBuffer(int64(ringSeconds) * 1_000_000'i64, ringMaxBytes)
+
+  let recorderOutputPattern = if eventFrames.len > 1: eventOutputPattern else: eventOutputPath
+  let eventRecorder = newEventRecorder(preSeconds, postSeconds, recorderOutputPattern, maxClipSeconds)
+  var eventClips: seq[EventClipResult]
+  var eventNextFrameIndex = 0
+  var eventTriggerCount = 0
+  var eventTriggerInfo: EventTriggerResult
 
   logStep("drawing and encoding first frame")
   timeVoid(timing.pixieOverlay):
-    drawPixieOverlay(rgbx, decodedFrames, maxFrames, fps, font, drawText)
-  encodeRgbxFrameNv12Timed(encoder, writer, rgbx, int64(decodedFrames), timing, packets, packetBytes)
+    drawPixieOverlay(rgbx, decodedFrames, maxFrames, fps, font, drawText, overlaySweepSeconds)
+  encodeRgbxFrameNv12Timed(encoder, writer, rgbx, int64(decodedFrames), timing, packets, packetBytes, packetBuffer, enablePacketRing, fps)
+  let firstFrameUsec = fps.timestampUsecForFrame(int64(decodedFrames))
+  while eventNextFrameIndex < eventFrames.len and decodedFrames >= eventFrames[eventNextFrameIndex]:
+    let explicitOutput = if eventFrames.len == 1: eventOutputPath else: ""
+    eventTriggerInfo = eventRecorder.trigger(firstFrameUsec, explicitOutput)
+    inc eventTriggerCount
+    let action = if eventTriggerInfo.started: "started" elif eventTriggerInfo.extended: "extended" else: "kept"
+    logStep(&"realtime event {action}: frame={eventFrames[eventNextFrameIndex]} eventUsec={firstFrameUsec} firstEvent={eventTriggerInfo.firstEventUsec} recordUntil={eventTriggerInfo.recordUntilUsec} maxUntil={eventTriggerInfo.maxRecordUntilUsec} clipped={eventTriggerInfo.clipped} output={eventTriggerInfo.outputPath}")
+    inc eventNextFrameIndex
+
+  if eventRecorder.readyToFinalize(packetBuffer):
+    let planned = check(eventRecorder.planEventWindowClip(
+      packetBuffer,
+      encodedStreamInfo,
+      eventRecorder.pendingEventUsec,
+      eventRecorder.pendingRecordUntilUsec,
+      eventRecorder.pendingOutputPath
+    ))
+    logStep(&"opening event MP4 writer: {planned.outputPath} startIndex={planned.startIndex} endIndex={planned.endIndexExclusive} requested={planned.requestedStartUsec}..{planned.requestedEndUsec} actualStart={planned.actualStartUsec} extradata={encodedStreamInfo.extradata.len} prependSpsPps={planned.prependedH264ParameterSets}")
+
+    var writtenClip: EventClipResult
+    timeVoid(timing.eventWrite):
+      writtenClip = check(eventRecorder.writePendingClip(packetBuffer, encodedStreamInfo))
+    eventClips.add(writtenClip)
+    logStep(&"finishing event MP4 writer: packets={writtenClip.packetsWritten}")
   inc decodedFrames
 
   var eof = false
@@ -691,19 +808,79 @@ proc main() =
       break
 
     timeVoid(timing.pixieOverlay):
-      drawPixieOverlay(rgbx, decodedFrames, maxFrames, fps, font, drawText)
+      drawPixieOverlay(rgbx, decodedFrames, maxFrames, fps, font, drawText, overlaySweepSeconds)
 
-    encodeRgbxFrameNv12Timed(encoder, writer, rgbx, int64(decodedFrames), timing, packets, packetBytes)
+    encodeRgbxFrameNv12Timed(encoder, writer, rgbx, int64(decodedFrames), timing, packets, packetBytes, packetBuffer, enablePacketRing, fps)
+    let frameUsec = fps.timestampUsecForFrame(int64(decodedFrames))
+    while eventNextFrameIndex < eventFrames.len and decodedFrames >= eventFrames[eventNextFrameIndex]:
+      let explicitOutput = if eventFrames.len == 1: eventOutputPath else: ""
+      eventTriggerInfo = eventRecorder.trigger(frameUsec, explicitOutput)
+      inc eventTriggerCount
+      let action = if eventTriggerInfo.started: "started" elif eventTriggerInfo.extended: "extended" else: "kept"
+      logStep(&"realtime event {action}: frame={eventFrames[eventNextFrameIndex]} eventUsec={frameUsec} firstEvent={eventTriggerInfo.firstEventUsec} recordUntil={eventTriggerInfo.recordUntilUsec} maxUntil={eventTriggerInfo.maxRecordUntilUsec} clipped={eventTriggerInfo.clipped} output={eventTriggerInfo.outputPath}")
+      inc eventNextFrameIndex
+
+    if eventRecorder.readyToFinalize(packetBuffer):
+      let planned = check(eventRecorder.planEventWindowClip(
+        packetBuffer,
+        encodedStreamInfo,
+        eventRecorder.pendingEventUsec,
+        eventRecorder.pendingRecordUntilUsec,
+        eventRecorder.pendingOutputPath
+      ))
+      logStep(&"opening event MP4 writer: {planned.outputPath} startIndex={planned.startIndex} endIndex={planned.endIndexExclusive} requested={planned.requestedStartUsec}..{planned.requestedEndUsec} actualStart={planned.actualStartUsec} extradata={encodedStreamInfo.extradata.len} prependSpsPps={planned.prependedH264ParameterSets}")
+
+      var writtenClip: EventClipResult
+      timeVoid(timing.eventWrite):
+        writtenClip = check(eventRecorder.writePendingClip(packetBuffer, encodedStreamInfo))
+      eventClips.add(writtenClip)
+      logStep(&"finishing event MP4 writer: packets={writtenClip.packetsWritten}")
     inc decodedFrames
 
   logStep("flushing encoder")
   timeVoid(timing.encoderFlush):
     checkVoid(encoder.flush())
-  drainEncoderTimed(encoder, writer, timing, packets, packetBytes)
+  drainEncoderTimed(encoder, writer, timing, packets, packetBytes, packetBuffer, enablePacketRing, fps)
+
+  if eventRecorder.hasPendingEvent():
+    let nowUsec = if packetBuffer.len > 0: packetBuffer.newestTimestampUsec() else: fps.timestampUsecForFrame(int64(max(decodedFrames - 1, 0)))
+    if eventRecorder.readyToFinalize(packetBuffer):
+      let planned = check(eventRecorder.planEventWindowClip(
+        packetBuffer,
+        encodedStreamInfo,
+        eventRecorder.pendingEventUsec,
+        eventRecorder.pendingRecordUntilUsec,
+        eventRecorder.pendingOutputPath
+      ))
+      logStep(&"opening event MP4 writer after flush: {planned.outputPath} startIndex={planned.startIndex} endIndex={planned.endIndexExclusive} requested={planned.requestedStartUsec}..{planned.requestedEndUsec} actualStart={planned.actualStartUsec} extradata={encodedStreamInfo.extradata.len} prependSpsPps={planned.prependedH264ParameterSets}")
+
+      var writtenClip: EventClipResult
+      timeVoid(timing.eventWrite):
+        writtenClip = check(eventRecorder.writePendingClip(packetBuffer, encodedStreamInfo))
+      eventClips.add(writtenClip)
+      logStep(&"finishing event MP4 writer: packets={writtenClip.packetsWritten}")
+    else:
+      logStep(&"pending event was not finalized: newestUsec={nowUsec} recordUntil={eventRecorder.pendingRecordUntilUsec}")
 
   logStep("finishing MP4 writer")
   timeVoid(timing.writerFinish):
     checkVoid(writer.finish())
+
+  var ringOutputPackets = 0
+  if ringOutputPath.len > 0:
+    if packetBuffer.len == 0:
+      failWith("Cannot write ring output: encoded packet ring is empty")
+
+    logStep(&"opening ring MP4 writer: {ringOutputPath}")
+    var ringWriter = check(openMp4VideoWriter(ringOutputPath, encodedStreamInfo))
+    try:
+      let startIndex = packetBuffer.findStartKeyframeIndex(packetBuffer.oldestTimestampUsec())
+      timeVoid(timing.ringWrite):
+        ringOutputPackets = check(ringWriter.writeEncodedPacketBuffer(packetBuffer, startIndex, rebaseTimestamps = true))
+      logStep(&"finishing ring MP4 writer: packets={ringOutputPackets}")
+      checkVoid(ringWriter.finish())
+    finally:
+      ringWriter.close()
 
   let totalMs = nowMs() - totalStartedAt
   let effectiveFps = if totalMs > 0.0: float(decodedFrames) * 1000.0 / totalMs else: 0.0
@@ -721,9 +898,34 @@ proc main() =
   echo &"  encoder size : {width}x{encoderHeight}"
   echo &"  nominal fps  : {fps.rateText()}"
   echo &"  bitrate      : {bitrate}"
+  echo &"  extradata    : {encodedStreamInfo.extradata.len} bytes"
   echo &"  frames       : {decodedFrames}"
   echo &"  packets      : {packets}"
   echo &"  packet bytes : {packetBytes}"
+  echo &"  overlay sweep: {overlaySweepSeconds}"
+  if enablePacketRing or dumpRingStats:
+    echo &"  ring enabled : {enablePacketRing}"
+    echo &"  ring seconds : {ringSeconds}"
+    echo &"  ring maxbytes: {ringMaxBytes}"
+    echo &"  ring stats   : {packetBuffer.statsText()}"
+  if ringOutputPath.len > 0:
+    echo &"  ring output  : {ringOutputPath}"
+    echo &"  ring written : {ringOutputPackets}"
+  if hasPseudoEvents:
+    echo &"  event frames : {eventFrames.eventFramesText()}"
+    echo &"  event state  : {eventRecorder.state}"
+    echo &"  event triggers: {eventTriggerCount}"
+    echo &"  event clips  : {eventClips.len}"
+  if hasPseudoEvents and eventClips.len > 0:
+    echo &"  event pre    : {preSeconds}"
+    echo &"  event post   : {postSeconds}"
+    echo &"  event max    : {maxClipSeconds}"
+    for i, clip in eventClips:
+      echo &"  event[{i}] request: {clip.requestedStartUsec}..{clip.requestedEndUsec}"
+      echo &"  event[{i}] actual : start_us={clip.actualStartUsec} start_index={clip.startIndex} end_index={clip.endIndexExclusive}"
+      echo &"  event[{i}] header : extradata={encodedStreamInfo.extradata.len} h264_ps_prefix={packetBuffer.h264ParameterSetPrefix.len} prepend_spspps={clip.prependedH264ParameterSets} require_spspps={clip.requiredParameterSets}"
+      echo &"  event[{i}] output : {clip.outputPath}"
+      echo &"  event[{i}] written: {clip.packetsWritten}"
   echo &"  i420 bytes   : {ownedI420.byteSize()}"
   echo &"  rgbx bytes   : {rgbx.byteSize()}"
   echo &"  total ms     : {totalMs.formatMs()}"

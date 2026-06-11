@@ -144,5 +144,6 @@ proc toEncodedPacketView*(packet: Packet; timeBase: Rational): FFmpegResult[Enco
     pts: raw[].pts,
     dts: raw[].dts,
     duration: raw[].duration,
+    isKeyframe: (int(raw[].flags) and int(AV_PKT_FLAG_KEY)) != 0,
     timeBase: timeBase
   ))

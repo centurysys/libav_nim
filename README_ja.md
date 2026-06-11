@@ -30,6 +30,16 @@ video frame を通常の userspace code から扱える状態にしつつ、deco
 - `libyuv_nim` による RGBX から padded NV12 への直接変換
 - pipeline の各段階を測定する stage timing test
 
+## High-level API
+
+encoded packet ring buffer や event clip recording などの再利用可能な
+high-level 部品については、README が長くなりすぎないように別文書へ分けています。
+
+詳細:
+
+- [High-level API 日本語](docs/highlevel-api.ja.md)
+- [High-level API](docs/highlevel-api.md)
+
 ## なぜ padded NV12 が必要か
 
 TI wave5 H.264 encoder では、YU12/yuv420p input path で 1080p frame を渡すと、出力画像がずれたり壊れたりすることがあります。

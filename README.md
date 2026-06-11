@@ -34,6 +34,16 @@ the hardware decoder and encoder.
 - Direct RGBX to padded NV12 conversion using `libyuv_nim`
 - Stage timing test programs for measuring each pipeline step
 
+## High-level API
+
+Reusable high-level building blocks for encoded packet buffering and event clip
+recording are documented separately to keep this README focused.
+
+See:
+
+- [High-level API](docs/highlevel-api.md)
+- [High-level API 日本語](docs/highlevel-api.ja.md)
+
 ## Why padded NV12?
 
 On TI wave5 H.264 encoder, the YU12/yuv420p input path can produce shifted or
