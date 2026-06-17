@@ -5,6 +5,7 @@ import lowlevel/frame
 import lowlevel/decoder
 import lowlevel/encoder
 import lowlevel/mp4_writer
+import lowlevel/rtsp_writer
 import lowlevel/i420
 import lowlevel/nv12
 import lowlevel/rgbx
@@ -17,6 +18,7 @@ export frame
 export decoder
 export encoder
 export mp4_writer
+export rtsp_writer
 export i420
 export nv12
 export rgbx
