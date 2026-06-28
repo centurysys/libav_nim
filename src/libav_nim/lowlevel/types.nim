@@ -731,7 +731,10 @@ proc toCodecId*(value: AVCodecID): CodecId =
 
 proc toPixelFormat*(value: AVPixelFormat): PixelFormat =
   case value
-  of AV_PIX_FMT_YUV420P:
+  of AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUVJ420P:
+    # AV_PIX_FMT_YUVJ420P is the deprecated/full-range variant of 8-bit
+    # planar 4:2:0.  Its memory layout is compatible with YUV420P/I420,
+    # so expose it as pfYuv420p for borrowed-plane consumers.
     result = pfYuv420p
   of AV_PIX_FMT_NV12:
     result = pfNv12
