@@ -1,6 +1,6 @@
 # Package
 
-version       = "0.1.0"
+version       = "0.1.1"
 author        = "Takeyoshi Kikuchi"
 description   = "Minimal Nim bindings and wrappers for FFmpeg libavcodec, libavformat, and libavutil."
 license       = "MIT"
